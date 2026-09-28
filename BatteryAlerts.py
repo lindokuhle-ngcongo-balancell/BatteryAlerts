@@ -6,8 +6,12 @@ Output is automatically named:  Battery_Alert_<Day>_<DD>_<Month>_<YYYY>.xlsx
 
 Usage:
     python txt_to_excel.py input.txt [--delimiter DELIM] [--no-header] [--no-region]
-                                      [--no-pivot] [--no-soc] [--lookup FILE]
-                                      [--aws-profile PROFILE]
+                                      [--no-pivot] [--no-soc] [--no-soc-at-start]
+                                      [--soc-at-start-window-hours HOURS]
+                                      [--no-ageing] [--historical-age-days DAYS]
+                                      [--no-stuck-soc] [--stuck-soc-threshold-pct PCT]
+                                      [--stuck-soc-min-days DAYS]
+                                      [--lookup FILE] [--aws-profile PROFILE]
 
 Arguments:
     input.txt       Path to the source text file (required)
@@ -15,8 +19,23 @@ Arguments:
                     or any single character (default: auto-detect)
     --no-header     Treat the first row as data, not a header
     --no-region     Skip the automatic Region column extraction
+    --no-odoo-region  Skip the Odoo fallback lookup for batteries with no
+                    Organisation Unit from the alert export
     --no-pivot      Skip the automatic Pivot sheet
     --no-soc        Skip the automatic Recent SoC lookup from Athena
+    --no-soc-at-start  Skip the SoC-at-alert-Started-At lookup
+    --soc-at-start-window-hours  How far before each alert's Started At
+                    to search for a reading (default: 2)
+    --no-ageing     Skip the 'Days Since Started' column and the
+                    historical-overdue sort/highlight
+    --historical-age-days  Alerts at least this many days old are flagged
+                    'Historical — overdue' and sorted to the top (default: 75)
+    --no-stuck-soc  Skip the 'SoC Health' stuck-battery flag
+    --stuck-soc-threshold-pct  Recent SoC at/below this percent counts as
+                    'low' (default: 5)
+    --stuck-soc-min-days  Alert must be open at least this many days,
+                    still at/below the SoC threshold, to be flagged as
+                    stuck (default: 14)
     --lookup FILE   Reference workbook (e.g. IP_Scrapped_data.xlsx) whose
                     first sheet maps 'Organisation Unit' -> 'Parent
                     Organisation Unit'. Used to resolve Region first,
@@ -25,13 +44,43 @@ Arguments:
                     (default: whatever boto3's default credential chain finds)
 
 Region extraction:
-    For each row's 'Organisation Unit' value:
+    Appends 'Region' and 'Sold-To Customer'. Region's resolution order,
+    per row's 'Organisation Unit' value:
       1. If --lookup was given, look it up there (exact match) and use
          the 'Parent Organisation Unit' as Region.
       2. If that misses, fall back to splitting a 'CCBSA - Bloemfontein'
          style value on ' - ' and using the part after the dash.
-      3. Otherwise Region is left blank.
-    The original Organisation Unit column is left unchanged.
+      3. If Organisation Unit is itself blank/'-' (so (1) and (2) had
+         nothing to work with), look up the row's 'Battery' serial in
+         Odoo instead — Odoo is the live system of record for where a
+         battery physically is, unlike the --lookup workbook, which is a
+         point-in-time export that goes stale as Organisation Units get
+         created/renamed. See get_odoo_region_fallback for the exact
+         query (stock.lot -> stock.quant/stock.move.line/stock.picking,
+         same pattern as the fleet-battery-report Warehousing project,
+         resolved to the actual customer company via
+         commercial_partner_id — not the raw delivery-contact name). The
+         resolved customer name is used ONLY internally here, to dash-
+         split it the same way as (2) IF it has a dash — it's not
+         surfaced as its own column (a company name like "EIE Industrial
+         power a division of CFAO Equipment SA" repeats identically
+         across every battery under that reseller, so 'Sold-To Customer'
+         below — the actual per-shipment reference — carries the useful
+         signal instead). Requires ODOO_URL/ODOO_DB/ODOO_USERNAME/
+         ODOO_API_KEY (env vars, e.g. via .env) — silently skipped if
+         unset. Skip explicitly with --no-odoo-region.
+      4. Otherwise Region is left blank.
+    'Sold-To Customer' is a separate field entirely from Region/Odoo's
+    customer name above — the Sale Order's own client_order_ref (Odoo's
+    own "Customer Reference" field, e.g. "KARGO NATIONAL
+    ORD-27264-27265- PE"), a purchase-order-style reference the CUSTOMER
+    supplied, run through _trim_po_prefix and populated whenever the
+    battery shipped via a sale order with one on file. Despite the
+    column name, it's NOT the customer's name and NOT our own SO number
+    — don't confuse the two when reading this column.
+    The original Organisation Unit column is left unchanged — Odoo only
+    fills in Region and Sold-To Customer, it never overwrites what the
+    alert export reported.
 
 Date extraction:
     If any column contains timestamps like "15 Jul 2026, 10:38", the script
@@ -50,13 +99,18 @@ Recent SoC lookup:
     two columns:
       - "Recent SoC (%)"        — the latest state-of-charge reading
       - "Recent SoC Updated At" — the timestamp of that reading
-    Batteries with no reading in the lookback window (or not found at
-    all) are left blank in both columns. The lookback window exists so
-    the query doesn't have to scan the table's entire history to find
-    the most recent row per battery, which can otherwise time out on a
-    large partitioned table. Adjust it with --soc-lookback-hours or
-    ATHENA_SOC_LOOKBACK_HOURS if 24h is too narrow for your fleet's
-    reporting cadence.
+    Batteries with no reading in the lookback window trigger a second,
+    unbounded "last-ever-seen" lookup so both columns can say which case
+    applies instead of just being left blank:
+      - "Battery Offline/Disconnected" if the battery has no history at
+        all in the table.
+      - "No Communication Since <timestamp>" if it reported before, using
+        its last-known reading's timestamp, however old.
+    The lookback window on the main query exists so it doesn't have to
+    scan the table's entire history to find the most recent row per
+    battery, which can otherwise time out on a large partitioned table.
+    Adjust it with --soc-lookback-hours or ATHENA_SOC_LOOKBACK_HOURS if
+    24h is too narrow for your fleet's reporting cadence.
     Requires boto3 and valid AWS credentials (env vars, ~/.aws/credentials,
     or --aws-profile). Skip with --no-soc if you don't want this (e.g. no
     network access to AWS from this machine).
@@ -93,6 +147,55 @@ Recent SoC lookup:
         ATHENA_SOC_LOOKBACK_HOURS=24   (how far back to scan for a recent reading)
     See .env.example for a template.
 
+SoC at Start lookup:
+    Separate from Recent SoC above. For each alert row, looks up the SoC
+    reading in effect at (or just before) THAT row's own 'Started At'
+    timestamp — not the battery's latest reading, but the reading closest
+    to when that specific alert began. Adds one column, inserted
+    immediately after 'Started At':
+      - "SoC at Start (%)"
+    Requires both 'Battery' and 'Started At' columns. Searches up to
+    ATHENA_SOC_AT_START_WINDOW_HOURS (default 2h, --soc-at-start-window-hours)
+    before each alert's timestamp for the nearest reading at or before it.
+    Rows with a blank/'-' Battery or unparseable Started At are left
+    blank. Rows with a valid Battery/Started At but no reading found in
+    that window instead get the same "Battery Offline/Disconnected" /
+    "No Communication Since <timestamp>" placeholder described above for
+    Recent SoC, resolved from the same unbounded last-ever-seen lookup.
+    Skip with --no-soc-at-start.
+    This runs as a SEPARATE Athena query from Recent SoC (matching up to
+    one row per unique alert timestamp instead of one row per battery),
+    so it adds its own runtime on top of whatever Recent SoC already
+    takes — and is subject to the same known batteries_v3 compaction
+    slowness described above.
+
+Ageing / historical-overdue flag:
+    Appends "Days Since Started" — integer day count from Started At to
+    today, based on each row's 'Started At'. An alert counts as
+    historical/overdue once it's at least --historical-age-days (default
+    75, env HISTORICAL_AGE_DAYS) days old. This is a ROLLING threshold
+    measured from today, not a fixed calendar date, so it keeps meaning
+    the same thing every time this report runs, rather than needing the
+    cutoff hand-updated as time passes.
+    Rows are then re-sorted (stably, so each group keeps its existing
+    relative order) so every historical/overdue row is pulled to the top
+    of the Data sheet instead of sitting buried at the bottom of an
+    otherwise reverse-chronological list, and given a highlight fill
+    across the whole row for visibility — there's no separate text flag
+    column for this; write_data_sheet re-derives it straight from "Days
+    Since Started" against the same threshold. Requires a 'Started At'
+    column. Skip with --no-ageing.
+
+Stuck-SoC flag:
+    Appends a "SoC Health" column, keyed on 'Battery', 'Started At', and
+    'Recent SoC (%)': flags "Stuck at <n>% — No Recovery (<d>d)" once an
+    alert's Recent SoC is at/below --stuck-soc-threshold-pct (default 5%)
+    AND it's been open at least --stuck-soc-min-days (default 14) days.
+    This is a heuristic from today's two numbers, not a scan of the
+    battery's full history — it can't distinguish "flat the whole time"
+    from "recovered partway and dropped again". Requires 'Recent SoC (%)'
+    (i.e. --no-soc must not be set). Skip with --no-stuck-soc.
+
 Pivot sheet:
     If the Data sheet ends up with "Date" and "Type" columns, a second
     sheet named "Pivot" is added:
@@ -113,8 +216,10 @@ Examples:
 
 import sys
 import os
+import re
 import time
 import argparse
+import xmlrpc.client
 from datetime import datetime, timedelta, timezone
 
 try:
@@ -149,7 +254,23 @@ HEADER_FILL  = PatternFill("solid", start_color="2E5B9A")
 HEADER_ALIGN = Alignment(horizontal="center", vertical="center", wrap_text=True)
 DATA_FONT    = Font(name="Arial", size=10)
 BOLD_FONT    = Font(name="Arial", size=10, bold=True)
+NO_DATA_FONT = Font(name="Arial", size=10, italic=True, color="999999")
 ALT_FILL     = PatternFill("solid", start_color="EEF2F7")
+NO_DATA_TEXT = "No data provided"  # fallback for rows with no valid Battery id to check at all
+BATTERY_OFFLINE_TEXT = "Battery Offline/Disconnected"  # battery has never reported a single reading
+NO_COMM_PREFIX = "No Communication Since "  # battery reported before, then went quiet; suffixed with its last-known timestamp
+
+HISTORICAL_FILL  = PatternFill("solid", start_color="FBDCD8")
+# Rolling threshold, not a fixed calendar date, so "overdue" keeps meaning
+# the same thing as this report keeps running week after week.
+HISTORICAL_AGE_DAYS = float(os.getenv("HISTORICAL_AGE_DAYS", "75"))
+
+STUCK_SOC_FONT = Font(name="Arial", size=10, bold=True, color="B45309")
+# SoC at/below this % counts as "low"; the alert must also have been open
+# at least this many days with the reading still stuck there before it's
+# flagged as a likely-dead battery rather than a normal in-progress alert.
+STUCK_SOC_THRESHOLD_PCT = float(os.getenv("STUCK_SOC_THRESHOLD_PCT", "5"))
+STUCK_SOC_MIN_DAYS      = float(os.getenv("STUCK_SOC_MIN_DAYS", "14"))
 
 # ---------------------------------------------------------------------------
 # Athena configuration — populated from environment variables (e.g. via a
@@ -174,6 +295,20 @@ DEFAULT_AWS_PROFILE   = os.getenv("AWS_PROFILE")  # None if unset -> boto3's def
 DEFAULT_AWS_REGION    = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")  # None -> defer to profile/config
 DEFAULT_S3_OUTPUT     = os.getenv("ATHENA_S3_OUTPUT")  # None -> use the workgroup's own result location
 SOC_LOOKBACK_HOURS     = float(os.getenv("ATHENA_SOC_LOOKBACK_HOURS", "24"))  # how far back to scan for a "recent" reading
+SOC_AT_START_WINDOW_HOURS = float(os.getenv("ATHENA_SOC_AT_START_WINDOW_HOURS", "2"))  # how far before each alert's Started At to search for a reading
+
+# ---------------------------------------------------------------------------
+# Odoo configuration — same env vars/pattern as the fleet-battery-report
+# Warehousing project's battery_warranty_etl.py, so a .env already set up
+# for that project can be reused here as-is. All optional: if any are
+# unset, the Odoo Region fallback below silently no-ops rather than erroring,
+# so this stays inert until someone deliberately configures it.
+# ---------------------------------------------------------------------------
+ODOO_URL      = os.getenv("ODOO_URL")
+ODOO_DB       = os.getenv("ODOO_DB")
+ODOO_USERNAME = os.getenv("ODOO_USERNAME")
+ODOO_API_KEY  = os.getenv("ODOO_API_KEY")
+ODOO_BATCH_SIZE = 200
 
 BATTERY_COLUMN_NAME   = "Battery"    # column in the input .txt that holds the device_serial
 SOC_POLL_INTERVAL_SEC = 2.0
@@ -270,14 +405,76 @@ def find_region_column(rows: list, has_header: bool) -> int:
     return best_col
 
 
-def add_region_column(rows: list, has_header: bool, region_lookup: dict = None) -> list:
+def _is_blank_or_dash(value) -> bool:
+    return value is None or str(value).strip() in ("", "-")
+
+
+# Matches a leading "PO" / "PO:" followed by a digit-led run of digits and
+# separators (dashes, spaces, '&', commas) — e.g. "PO: 7814-7815 " or
+# "PO234749 ". Deliberately anchored to the START of the string only: PO
+# numbers embedded mid-string ("TOYOTA STR POLOKANE PO-28262 JHB") or at
+# the end ("TRANSPORT COSTS DBN- PO7577") are left alone rather than risk
+# a wrong match. client_order_ref is free text with no fixed format (a
+# broad real-data sample turned up plain names, quote references, repair-
+# order refs, and PO numbers in every position), so this only ever
+# handles the "PO number as a clean prefix" case — most PO-bearing values
+# won't match at all, and that's intentional: better to leave a PO number
+# in place than to guess wrong and mangle real text elsewhere in the
+# string.
+_PO_PREFIX_RE = re.compile(r"^PO:?\s*\d[\d\-\s&,]*")
+
+
+def _trim_po_prefix(text: str) -> str:
     """
-    Appends a 'Region' column. Resolution order per row:
+    Strips a clean leading PO-number prefix (see _PO_PREFIX_RE) off
+    `text`, e.g. "PO: 7814-7815 TOYOTA NEW SALES - PE" -> "TOYOTA NEW
+    SALES - PE". If there's no match, or the match consumes the ENTIRE
+    string (e.g. "PO100213" is nothing but a PO number), returns `text`
+    unchanged — trimming to an empty string would throw away the only
+    information the field had.
+    """
+    if not text:
+        return text
+    match = _PO_PREFIX_RE.match(text)
+    if not match:
+        return text
+    remainder = text[match.end():].strip(" -:")
+    return remainder or text
+
+
+def add_region_column(
+    rows: list,
+    has_header: bool,
+    region_lookup: dict = None,
+    odoo_fallback: dict = None,
+) -> list:
+    """
+    Appends 'Region' and 'Sold-To Customer' columns. Region's resolution
+    order per row:
       1. If a region_lookup dict is supplied, look up the row's
          'Organisation Unit' value in it (exact match).
       2. If that misses (or no lookup was supplied), fall back to
          splitting a 'CCBSA - Bloemfontein' style value on ' - '.
-      3. Otherwise Region is left blank.
+      3. If Organisation Unit is itself blank/'-' (so (1) and (2) had
+         nothing to work with) and an odoo_fallback dict is supplied,
+         look up the row's 'Battery' serial in it — see
+         get_odoo_region_fallback for how that's built — and dash-split
+         the resolved name the same way as (2), IF it has a dash.
+      4. Otherwise Region is left blank.
+
+    Odoo's resolved name (odoo_fallback[battery]["name"]) is used ONLY
+    for that dash-split — it's often a full legal customer name (e.g.
+    "EIE Industrial power a division of CFAO Equipment SA") that's
+    identical across every battery under that reseller, so it isn't
+    surfaced as its own column; 'Sold-To Customer' below carries the
+    per-shipment signal instead.
+
+    'Sold-To Customer' is odoo_fallback's separate customer_reference
+    value (the Sale Order's own client_order_ref, NOT our SO number and
+    despite "Customer" in its name, NOT the customer's name either — see
+    get_odoo_region_fallback), populated whenever the row's Battery has
+    one on file, independent of whether Region got filled.
+
     The source column(s) are left unchanged.
     """
     headers = rows[0] if has_header else None
@@ -291,11 +488,14 @@ def add_region_column(rows: list, has_header: bool, region_lookup: dict = None) 
     if org_col == -1:
         return rows  # nothing to key off of
 
+    battery_col = headers.index(BATTERY_COLUMN_NAME) if headers and BATTERY_COLUMN_NAME in headers else -1
+
     new_rows = []
     for r_idx, row in enumerate(rows):
         row = list(row)  # copy
         if has_header and r_idx == 0:
             row.append("Region")
+            row.append("Sold-To Customer")
         else:
             value = row[org_col].strip() if org_col < len(row) and row[org_col] else ""
 
@@ -305,10 +505,221 @@ def add_region_column(rows: list, has_header: bool, region_lookup: dict = None) 
             if not region and REGION_SPLIT in value:
                 region = value.split(REGION_SPLIT, 1)[1].strip()
 
+            odoo_name = None
+            customer_reference = None
+            if _is_blank_or_dash(value) and odoo_fallback and battery_col != -1:
+                battery = row[battery_col].strip() if battery_col < len(row) and row[battery_col] else ""
+                odoo_match = odoo_fallback.get(battery) if battery else None
+                if odoo_match:
+                    odoo_name = odoo_match.get("name")
+                    customer_reference = odoo_match.get("customer_reference")
+                if not region and odoo_name and REGION_SPLIT in odoo_name:
+                    region = odoo_name.split(REGION_SPLIT, 1)[1].strip()
+
             row.append(region)
+            row.append(customer_reference or "")
         new_rows.append(row)
 
     return new_rows
+
+
+def get_odoo_region_fallback(battery_serials: list) -> dict:
+    """
+    For batteries whose Organisation Unit came back blank/'-' from the
+    alert export (so --lookup/dash-splitting in add_region_column had
+    nothing to work with), asks Odoo — the actual system of record for
+    where a battery physically is — for its current customer or location
+    name, to use as an Organisation Unit stand-in for Region resolution.
+
+    Ports the connection/fetch pattern from the fleet-battery-report
+    Warehousing project's battery_warranty_etl.py (stock.lot ->
+    stock.quant/stock.location for current location, stock.move.line/
+    stock.picking for the customer it shipped to), scoped down to just
+    the serials that actually need it instead of the whole fleet.
+
+    Returns {battery_serial: {"name": ..., "customer_reference": ...}}.
+    "name" is the actual customer company name (Odoo's
+    commercial_partner_id, not the raw delivery contact — see the note
+    below) if the battery is currently at a customer site, otherwise the
+    stock location's complete_name (e.g. a warehouse). "customer_reference"
+    is the Sale Order's client_order_ref (Odoo's own "Customer Reference"
+    field, e.g. "KARGO NATIONAL ORD-27264-27265- PE" — a purchase-order-
+    style reference the CUSTOMER supplied, distinct from both our own SO
+    number and the customer's name) when the battery shipped via a sale
+    order; None when it didn't (e.g. sitting in an internal warehouse) or
+    the order has no reference on file. Run through _trim_po_prefix
+    first, which strips a leading "PO: <number>" prefix when it's a
+    clean match — see that function for why this is a best-effort trim,
+    not a guaranteed-correct one (client_order_ref is inconsistent free
+    text with no fixed format).
+
+    Serials not found in Odoo at all, or found but sitting at a location
+    with neither a name nor a customer, are absent from the result.
+
+    Requires ODOO_URL, ODOO_DB, ODOO_USERNAME, ODOO_API_KEY (env vars,
+    e.g. via .env, same keys as the Warehousing project) — returns {}
+    without querying if any are unset, so this stays a no-op until Odoo
+    is actually configured for this project.
+    """
+    if not battery_serials:
+        return {}
+
+    if not all([ODOO_URL, ODOO_DB, ODOO_USERNAME, ODOO_API_KEY]):
+        return {}
+
+    common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
+    uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_API_KEY, {})
+    if not uid:
+        print("  (Odoo Region fallback: authentication failed — check ODOO_DB/ODOO_USERNAME/ODOO_API_KEY)")
+        return {}
+    models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+
+    def search_read_all(model, domain, fields, order="id asc"):
+        all_rows = []
+        offset = 0
+        while True:
+            batch = models.execute_kw(
+                ODOO_DB, uid, ODOO_API_KEY,
+                model, "search_read",
+                [domain],
+                {"fields": fields, "limit": ODOO_BATCH_SIZE, "offset": offset, "order": order},
+            )
+            if not batch:
+                break
+            all_rows.extend(batch)
+            if len(batch) < ODOO_BATCH_SIZE:
+                break
+            offset += len(batch)
+        return all_rows
+
+    lots = search_read_all(
+        "stock.lot", [["name", "in", battery_serials]], ["id", "name"], order="name asc",
+    )
+    if not lots:
+        return {}
+    lot_ids = [lot["id"] for lot in lots]
+
+    # Current location per lot: the location holding the highest quantity,
+    # same tie-break as battery_warranty_etl.fetch_current_locations.
+    quants = search_read_all(
+        "stock.quant", [["lot_id", "in", lot_ids], ["quantity", ">", 0]],
+        ["lot_id", "location_id", "quantity"], order="lot_id asc",
+    )
+    loc_ids = list({q["location_id"][0] for q in quants if q.get("location_id")})
+    locs = search_read_all(
+        "stock.location", [["id", "in", loc_ids]], ["id", "complete_name", "usage"],
+    ) if loc_ids else []
+    loc_by_id = {loc["id"]: loc for loc in locs}
+
+    loc_map = {}
+    for q in quants:
+        lot_id = q["lot_id"][0]
+        loc = loc_by_id.get(q["location_id"][0], {})
+        existing = loc_map.get(lot_id)
+        if not existing or q["quantity"] > existing["quantity"]:
+            loc_map[lot_id] = {
+                "location_id": q["location_id"][0],
+                "location_name": loc.get("complete_name", ""),
+                "usage": loc.get("usage", ""),
+            }
+
+    # For lots currently at a customer, trace back to who it was delivered
+    # to (same pattern as compute_first_delivery_to_current_owner).
+    customer_lot_ids = [lid for lid in lot_ids if loc_map.get(lid, {}).get("usage") == "customer"]
+    deliveries_by_lot = {}
+    if customer_lot_ids:
+        lines = search_read_all(
+            "stock.move.line",
+            [
+                ["lot_id", "in", customer_lot_ids],
+                ["picking_id.picking_type_id.code", "=", "outgoing"],
+                ["picking_id.state", "=", "done"],
+                ["location_dest_id.usage", "=", "customer"],
+            ],
+            ["lot_id", "location_dest_id", "picking_id", "date"], order="date asc",
+        )
+        for ml in lines:
+            deliveries_by_lot.setdefault(ml["lot_id"][0], []).append({
+                "location_dest_id": ml["location_dest_id"][0],
+                "picking_id": ml["picking_id"][0],
+                "date": str(ml.get("date", ""))[:10],
+            })
+
+    first_delivery_map = {}
+    for lot_id, records in deliveries_by_lot.items():
+        loc = loc_map.get(lot_id)
+        if not loc or loc["usage"] != "customer":
+            continue
+        matching = [r for r in records if r["location_dest_id"] == loc["location_id"]] or records
+        matching.sort(key=lambda r: r["date"])
+        first_delivery_map[lot_id] = matching[0]
+
+    # Resolve to the actual customer company (commercial_partner_id), not
+    # the raw delivery contact — Odoo's partner_id on a picking is often a
+    # specific ship-to contact/address under that customer, whose own
+    # display_name is a "<Company>, <Contact>" compound (e.g. "EIE
+    # Industrial power a division of CFAO Equipment SA, Durban"). That's
+    # not a customer name, it's a location description wearing a comma.
+    # commercial_partner_id walks up to the actual top-level customer
+    # regardless of which specific contact/address was on the delivery.
+    picking_ids = list({d["picking_id"] for d in first_delivery_map.values()})
+    picking_partner = {}
+    picking_customer_ref = {}
+    if picking_ids:
+        pickings = search_read_all(
+            "stock.picking", [["id", "in", picking_ids]], ["id", "partner_id", "sale_id"],
+        )
+        partner_ids = list({p["partner_id"][0] for p in pickings if p.get("partner_id")})
+        customer_name_by_partner_id = {}
+        if partner_ids:
+            partners = search_read_all(
+                "res.partner", [["id", "in", partner_ids]], ["id", "commercial_partner_id"],
+            )
+            customer_name_by_partner_id = {
+                p["id"]: (p["commercial_partner_id"][1] if p.get("commercial_partner_id") else "")
+                for p in partners
+            }
+        picking_partner = {
+            p["id"]: customer_name_by_partner_id.get(p["partner_id"][0], "") if p.get("partner_id") else ""
+            for p in pickings
+        }
+
+        # Customer Reference (client_order_ref) lives on the linked Sale
+        # Order, not on the picking itself — stock.picking.sale_id gives a
+        # direct link, no need to parse the picking's free-text 'origin'.
+        sale_ids = list({p["sale_id"][0] for p in pickings if p.get("sale_id")})
+        customer_ref_by_sale_id = {}
+        if sale_ids:
+            orders = search_read_all(
+                "sale.order", [["id", "in", sale_ids]], ["id", "client_order_ref"],
+            )
+            customer_ref_by_sale_id = {
+                o["id"]: (_trim_po_prefix(o["client_order_ref"]) if o.get("client_order_ref") else None)
+                for o in orders
+            }
+        picking_customer_ref = {
+            p["id"]: customer_ref_by_sale_id.get(p["sale_id"][0]) if p.get("sale_id") else None
+            for p in pickings
+        }
+
+    resolved = {}
+    for lot in lots:
+        lot_id = lot["id"]
+        loc = loc_map.get(lot_id, {})
+        deliv = first_delivery_map.get(lot_id) if loc.get("usage") == "customer" else None
+        picking_id = deliv["picking_id"] if deliv else None
+
+        if loc.get("usage") == "customer":
+            name = (picking_partner.get(picking_id) if picking_id else None) or loc.get("location_name") or None
+        else:
+            name = loc.get("location_name") or None
+
+        customer_reference = picking_customer_ref.get(picking_id) if picking_id else None
+
+        if name:
+            resolved[lot["name"]] = {"name": name, "customer_reference": customer_reference}
+
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +776,76 @@ def add_date_hour_columns(rows: list, has_header: bool) -> list:
         new_rows.append(row)
 
     return new_rows
+
+
+# ---------------------------------------------------------------------------
+# Ageing / historical-overdue flag
+# ---------------------------------------------------------------------------
+
+def add_ageing_column(rows: list, has_header: bool, historical_age_days: float = None) -> list:
+    """
+    Appends 'Days Since Started' (integer day count) based on the
+    'Started At' column, then re-sorts the data rows so historical/
+    overdue alerts (see HISTORICAL_AGE_DAYS) surface at the top instead
+    of sitting buried at the bottom of an otherwise reverse-chronological
+    list. write_data_sheet re-derives which rows are historical straight
+    from this column (value >= historical_age_days) to apply the red
+    highlight fill — there's no separate text flag column, since between
+    the sort position, the highlight, and the day count itself, a fourth
+    "Historical — overdue" label added nothing.
+
+    This is a ROLLING threshold measured from today, not a fixed
+    calendar cutoff — so it keeps meaning the same thing ("this has been
+    sitting unresolved a long time") no matter how many weeks this
+    report keeps running for, instead of needing the cutoff date
+    hand-updated each time.
+
+    The re-sort is stable: within the "historical" group and the
+    "current" group, rows keep their existing relative order (normally
+    reverse-chronological), so this only pulls the historical block to
+    the front rather than fully re-ordering everything.
+
+    Rows with a blank/unparseable 'Started At' are left blank in the new
+    column and sort as non-historical (i.e. they stay wherever they'd
+    otherwise land, rather than being pulled to the top).
+    """
+    if not has_header:
+        print("  (Skipping Ageing: --no-header means there's no 'Started At' column to key off)")
+        return rows
+
+    headers = rows[0]
+    if "Started At" not in headers:
+        print("  (Skipping Ageing: no 'Started At' column found)")
+        return rows
+
+    if historical_age_days is None:
+        historical_age_days = HISTORICAL_AGE_DAYS
+
+    started_col = headers.index("Started At")
+    today = datetime.now().date()
+
+    enriched = []
+    for row in rows[1:]:
+        row = list(row)
+        started_raw = row[started_col].strip() if started_col < len(row) and row[started_col] else ""
+        dt = parse_datetime(started_raw)
+        if dt is None:
+            days_since = ""
+            is_historical = False
+        else:
+            days_since = (today - dt.date()).days
+            is_historical = days_since >= historical_age_days
+        row.append(days_since)
+        enriched.append((is_historical, row))
+
+    historical_count = sum(1 for is_historical, _ in enriched if is_historical)
+    print(f"  Ageing: {historical_count}/{len(enriched)} alerts are at least "
+          f"{historical_age_days:g} days old — moved to the top")
+
+    enriched.sort(key=lambda pair: 0 if pair[0] else 1)
+
+    new_header = list(rows[0]) + ["Days Since Started"]
+    return [new_header] + [row for _, row in enriched]
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +978,13 @@ def get_recent_soc(
         safe (never excludes a row we want) because a record can't be
         received before it was generated, so time_received — and
         therefore hour_inserted — is always >= time_stamp.
+      - There's also an upper bound, `time_stamp <= <now>`. batteries_v3
+        has been observed (e.g. device P16-000097) returning corrupt rows
+        stamped with impossible future dates like 2112-01-01. Without an
+        upper bound, ORDER BY time_stamp DESC always ranks such a row
+        first, permanently shadowing the device's real recent reading.
+        Real readings can't be timestamped in the future, so this filter
+        never excludes a row we'd actually want.
 
     Returns {bem_id: (soc_str, timestamp_str)}. bem_ids not found within
     the lookback window are simply absent from the returned dict.
@@ -507,7 +995,9 @@ def get_recent_soc(
     if lookback_hours is None:
         lookback_hours = SOC_LOOKBACK_HOURS
 
-    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=lookback_hours)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    cutoff = now - timedelta(hours=lookback_hours)
+    now_literal = now.strftime("%Y-%m-%d %H:%M:%S")
     cutoff_literal = cutoff.strftime("%Y-%m-%d %H:%M:%S")
     cutoff_hour_literal = cutoff.strftime("%Y-%m-%d-%H")
 
@@ -526,6 +1016,7 @@ def get_recent_soc(
             WHERE {ATHENA_BEM_ID_COL} IN ({quoted_ids})
               AND {ATHENA_HOUR_INSERTED_COL} >= '{cutoff_hour_literal}'
               AND {ATHENA_TIMESTAMP_COL} >= timestamp '{cutoff_literal}'
+              AND {ATHENA_TIMESTAMP_COL} <= timestamp '{now_literal}'
             GROUP BY {ATHENA_BEM_ID_COL}, bem_id, sequence_number
         ),
         ranked AS (
@@ -552,6 +1043,61 @@ def get_recent_soc(
     return soc_by_id
 
 
+def get_last_seen(
+    bem_ids: list,
+    aws_profile: str = None,
+    region: str = None,
+    s3_output: str = None,
+) -> dict:
+    """
+    For each bem_id in `bem_ids`, finds the single most recent time_stamp
+    it has EVER reported — no lookback window (unlike get_recent_soc/
+    get_soc_at_timestamps, deliberately no hour_inserted/time_stamp LOWER
+    bound, since the whole point is to find readings that may be far
+    outside any lookback window). This is what lets a battery that has
+    simply gone quiet (present here, with an old timestamp) be told apart
+    from one that has never reported at all (absent from the result
+    entirely).
+
+    Does still cap time_stamp at "now": batteries_v3 has been observed
+    (e.g. device P16-000097) returning rows corrupted with impossible
+    future dates like 2112-01-01, and MAX(time_stamp) with no upper bound
+    would report that garbage value as the "last seen" reading. A real
+    reading can't be timestamped in the future, so this never excludes a
+    row we'd actually want.
+
+    Only call this for the (typically small) set of bem_ids that already
+    missed a windowed lookup elsewhere, so the full-history scan stays
+    cheap.
+
+    Returns {bem_id: last_seen_timestamp_str}. bem_ids with no reading in
+    the table at all are simply absent from the returned dict.
+    """
+    if not bem_ids:
+        return {}
+
+    now_literal = datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+    quoted_ids = ", ".join("'" + bid.replace("'", "''") + "'" for bid in bem_ids)
+
+    sql = f"""
+        SELECT {ATHENA_BEM_ID_COL} AS bem_id, MAX({ATHENA_TIMESTAMP_COL}) AS last_seen
+        FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
+        WHERE {ATHENA_BEM_ID_COL} IN ({quoted_ids})
+          AND {ATHENA_TIMESTAMP_COL} <= timestamp '{now_literal}'
+        GROUP BY {ATHENA_BEM_ID_COL}
+    """
+
+    rows = _run_athena_query(sql, aws_profile=aws_profile, region=region, s3_output=s3_output)
+
+    last_seen_by_id = {}
+    for r in rows:
+        bem_id = r.get("bem_id")
+        if bem_id:
+            last_seen_by_id[bem_id] = r.get("last_seen")
+
+    return last_seen_by_id
+
+
 def add_recent_soc_column(
     rows: list,
     has_header: bool,
@@ -562,9 +1108,13 @@ def add_recent_soc_column(
 ) -> list:
     """
     Appends 'Recent SoC (%)' and 'Recent SoC Updated At' columns, keyed
-    on the 'Battery' column (treated as bem_id). Batteries not found in
-    Athena within the lookback window, or blank/placeholder ('-') values,
-    are left blank.
+    on the 'Battery' column (treated as bem_id). Blank/placeholder ('-')
+    Battery values are left blank in both columns. Batteries with a real
+    id but no reading in Athena within the lookback window get a
+    no-data placeholder in both columns instead — "Battery
+    Offline/Disconnected" if they have never reported at all, or
+    "No Communication Since <timestamp>" (their last-ever-seen reading)
+    if they reported before and went quiet.
     """
     if not has_header:
         print("  (Skipping Recent SoC: --no-header means there's no 'Battery' column to key off)")
@@ -597,6 +1147,16 @@ def add_recent_soc_column(
     print(f"  Recent SoC: matched {matched}/{len(bem_ids)} batteries in Athena "
           f"(last {effective_lookback:g}h)")
 
+    missing_ids = [bid for bid in bem_ids if bid not in soc_by_id]
+    last_seen_by_id = {}
+    if missing_ids:
+        print(f"  Recent SoC: checking last-ever-seen timestamp for "
+              f"{len(missing_ids)} batteries with no reading in the last "
+              f"{effective_lookback:g}h")
+        last_seen_by_id = get_last_seen(
+            missing_ids, aws_profile=aws_profile, region=region, s3_output=s3_output,
+        )
+
     new_rows = []
     for r_idx, row in enumerate(rows):
         row = list(row)
@@ -606,8 +1166,292 @@ def add_recent_soc_column(
         else:
             value = row[battery_col].strip() if battery_col < len(row) and row[battery_col] else ""
             soc, ts = soc_by_id.get(value, (None, None))
-            row.append(soc if soc is not None else "")
-            row.append(ts if ts is not None else "")
+            if soc is not None:
+                row.append(soc)
+                row.append(ts)
+            elif value and value != "-":
+                last_seen = last_seen_by_id.get(value)
+                placeholder = f"{NO_COMM_PREFIX}{last_seen}" if last_seen else BATTERY_OFFLINE_TEXT
+                row.append(placeholder)
+                row.append(placeholder)
+            else:
+                row.append("")
+                row.append("")
+        new_rows.append(row)
+
+    return new_rows
+
+
+def add_stuck_soc_flag(
+    rows: list,
+    has_header: bool,
+    soc_threshold_pct: float = None,
+    min_days: float = None,
+) -> list:
+    """
+    Appends a 'SoC Health' column, flagging a row when its battery's
+    'Recent SoC (%)' is at/below `soc_threshold_pct` (default
+    STUCK_SOC_THRESHOLD_PCT, ~5%) AND the alert has been open at least
+    `min_days` (default STUCK_SOC_MIN_DAYS, ~14 days) — i.e. a battery
+    that's been sitting dead for a long time rather than one that's just
+    started draining.
+
+    This is a heuristic from the two numbers already on hand (today's
+    Recent SoC, and today minus Started At), not a scan of the battery's
+    full SoC history — it can't tell "flat at 0% the entire time" apart
+    from "recovered partway through and dropped back to 0% again". If
+    that distinction matters, it needs its own Athena query (MIN/MAX SoC
+    over the alert's lifetime) rather than reusing this column.
+
+    Must run after add_recent_soc_column (needs 'Recent SoC (%)') and
+    requires 'Battery' and 'Started At'. Rows with a non-numeric Recent
+    SoC (blank, or one of the add_recent_soc_column placeholders like
+    "Battery Offline/Disconnected") or an unparseable Started At are left
+    blank — there's nothing to compare against.
+    """
+    if not has_header:
+        print("  (Skipping SoC Health: --no-header means there's no 'Recent SoC (%)'/'Started At' column to key off)")
+        return rows
+
+    headers = rows[0]
+    required = ("Battery", "Started At", "Recent SoC (%)")
+    if not all(h in headers for h in required):
+        print("  (Skipping SoC Health: need 'Battery', 'Started At', and 'Recent SoC (%)' columns)")
+        return rows
+
+    if soc_threshold_pct is None:
+        soc_threshold_pct = STUCK_SOC_THRESHOLD_PCT
+    if min_days is None:
+        min_days = STUCK_SOC_MIN_DAYS
+
+    started_col = headers.index("Started At")
+    soc_col = headers.index("Recent SoC (%)")
+    today = datetime.now().date()
+
+    new_rows = [rows[0] + ["SoC Health"]]
+    flagged = 0
+    for row in rows[1:]:
+        row = list(row)
+        started_raw = row[started_col].strip() if started_col < len(row) and row[started_col] else ""
+        soc_raw = row[soc_col] if soc_col < len(row) else None
+
+        dt = parse_datetime(started_raw)
+        status = ""
+        if dt is not None:
+            try:
+                soc_value = float(soc_raw)
+            except (TypeError, ValueError):
+                soc_value = None
+            if soc_value is not None:
+                days_open = (today - dt.date()).days
+                if soc_value <= soc_threshold_pct and days_open >= min_days:
+                    status = f"Stuck at {soc_value:g}% — No Recovery ({days_open}d)"
+                    flagged += 1
+        row.append(status)
+        new_rows.append(row)
+
+    print(f"  SoC Health: {flagged} alert(s) flagged as stuck at "
+          f"<={soc_threshold_pct:g}% SoC for >={min_days:g} days with no recovery")
+
+    return new_rows
+
+
+def get_soc_at_timestamps(
+    pairs: list,
+    aws_profile: str = None,
+    region: str = None,
+    s3_output: str = None,
+    search_window_hours: float = None,
+) -> dict:
+    """
+    For each (device_serial, target_dt) pair in `pairs`, finds the most
+    recent SoC reading at or before target_dt, searching back up to
+    `search_window_hours` (default SOC_AT_START_WINDOW_HOURS) in case
+    there's a gap right at that moment. Uses a single Athena query built
+    from a VALUES list covering every pair at once.
+
+    Each pair is matched back by a synthetic integer index rather than by
+    round-tripping the timestamp through Athena's string formatting (which
+    can add trailing zeros/microseconds), so there's no ambiguity matching
+    results back to the original (device_serial, target_dt) keys.
+
+    Returns {(device_serial, target_dt): (soc_str, time_stamp_str)}. Pairs
+    with no reading found in the window are simply absent from the dict.
+    """
+    if not pairs:
+        return {}
+
+    if search_window_hours is None:
+        search_window_hours = SOC_AT_START_WINDOW_HOURS
+    window_minutes = max(1, round(search_window_hours * 60))
+
+    values_list = ",\n            ".join(
+        f"({idx}, '{dev.replace(chr(39), chr(39) * 2)}', "
+        f"TIMESTAMP '{dt.strftime('%Y-%m-%d %H:%M:%S')}')"
+        for idx, (dev, dt) in enumerate(pairs)
+    )
+
+    # Global bounds across all targets, used only to help Athena/Iceberg
+    # skip files — correctness comes from the per-row
+    # b.time_stamp <= t.target_ts join condition below, not from these.
+    earliest_target = min(dt for _, dt in pairs)
+    latest_target = max(dt for _, dt in pairs)
+    global_lower = earliest_target - timedelta(hours=search_window_hours)
+    global_hour_inserted_floor = global_lower.strftime("%Y-%m-%d-%H")
+    global_time_stamp_floor = global_lower.strftime("%Y-%m-%d %H:%M:%S")
+    global_time_stamp_ceiling = latest_target.strftime("%Y-%m-%d %H:%M:%S")
+
+    sql = f"""
+        WITH targets (idx, device_serial, target_ts) AS (
+            VALUES
+            {values_list}
+        ),
+        candidates AS (
+            SELECT
+                t.idx,
+                b.bem_id,
+                b.sequence_number,
+                max_by(b.{ATHENA_SOC_COL}, b.time_received) AS soc,
+                CAST(max_by(b.{ATHENA_TIMESTAMP_COL}, b.time_received) AS timestamp) AS time_stamp
+            FROM targets t
+            JOIN {ATHENA_DATABASE}.{ATHENA_TABLE} b
+              ON b.{ATHENA_BEM_ID_COL} = t.device_serial
+             AND b.{ATHENA_TIMESTAMP_COL} <= t.target_ts
+             AND b.{ATHENA_TIMESTAMP_COL} >= t.target_ts - INTERVAL '{window_minutes}' MINUTE
+             AND b.{ATHENA_HOUR_INSERTED_COL} >= '{global_hour_inserted_floor}'
+             AND b.{ATHENA_TIMESTAMP_COL} >= timestamp '{global_time_stamp_floor}'
+             AND b.{ATHENA_TIMESTAMP_COL} <= timestamp '{global_time_stamp_ceiling}'
+            GROUP BY t.idx, b.bem_id, b.sequence_number
+        ),
+        ranked AS (
+            SELECT *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY idx
+                    ORDER BY time_stamp DESC, sequence_number DESC
+                ) AS rn
+            FROM candidates
+        )
+        SELECT idx, soc, time_stamp
+        FROM ranked
+        WHERE rn = 1
+    """
+
+    rows = _run_athena_query(sql, aws_profile=aws_profile, region=region, s3_output=s3_output)
+
+    result = {}
+    for r in rows:
+        idx_raw = r.get("idx")
+        if idx_raw is None:
+            continue
+        idx = int(idx_raw)
+        if 0 <= idx < len(pairs):
+            result[pairs[idx]] = (r.get("soc"), r.get("time_stamp"))
+
+    return result
+
+
+def add_soc_at_alert_time_column(
+    rows: list,
+    has_header: bool,
+    aws_profile: str = None,
+    region: str = None,
+    s3_output: str = None,
+    search_window_hours: float = None,
+) -> list:
+    """
+    Inserts a 'SoC at Start (%)' column immediately after 'Started At':
+    for each alert row, looks up the SoC reading in effect at (or just
+    before) THAT row's own Started At timestamp — not the battery's
+    latest reading (see add_recent_soc_column for that), but the reading
+    closest to when that specific alert began.
+
+    Rows with a blank/'-' Battery, a blank Started At, or an unparseable
+    Started At are left blank. Rows with a real Battery/Started At but no
+    reading found in the search window get a no-data placeholder instead
+    — "Battery Offline/Disconnected" if that battery has never reported
+    at all, or "No Communication Since <timestamp>" (its last-ever-seen
+    reading) if it reported before and went quiet. Requires both
+    'Battery' and 'Started At' columns to be present.
+    """
+    if not has_header:
+        print("  (Skipping SoC at Start: --no-header means there's no 'Battery'/'Started At' column to key off)")
+        return rows
+
+    headers = rows[0]
+    if BATTERY_COLUMN_NAME not in headers or "Started At" not in headers:
+        print("  (Skipping SoC at Start: need both 'Battery' and 'Started At' columns)")
+        return rows
+
+    battery_col = headers.index(BATTERY_COLUMN_NAME)
+    started_col = headers.index("Started At")
+    data_rows = rows[1:]
+
+    # Build the (device_serial, target_dt) each row needs, and the
+    # deduplicated set of unique pairs to actually query Athena for.
+    row_targets = []
+    seen_pairs = {}
+    for row in data_rows:
+        battery = row[battery_col].strip() if battery_col < len(row) and row[battery_col] else ""
+        started_raw = row[started_col].strip() if started_col < len(row) and row[started_col] else ""
+        if not battery or battery == "-" or not started_raw:
+            row_targets.append(None)
+            continue
+        target_dt = parse_datetime(started_raw)
+        if target_dt is None:
+            row_targets.append(None)
+            continue
+        pair = (battery, target_dt)
+        row_targets.append(pair)
+        seen_pairs[pair] = True
+
+    unique_pairs = list(seen_pairs.keys())
+
+    if not unique_pairs:
+        print("  (Skipping SoC at Start: no rows had both a usable Battery and a parseable Started At)")
+        soc_by_pair = {}
+    else:
+        effective_window = SOC_AT_START_WINDOW_HOURS if search_window_hours is None else search_window_hours
+        print(f"  SoC at Start: looking up {len(unique_pairs)} unique battery/time "
+              f"combinations from Athena (searching up to {effective_window:g}h "
+              f"before each alert) — note: analytics.batteries_v3 has a known "
+              f"compaction/small-files issue that can make even trivial "
+              f"queries slow; this may take a while")
+        soc_by_pair = get_soc_at_timestamps(
+            unique_pairs, aws_profile=aws_profile, region=region, s3_output=s3_output,
+            search_window_hours=effective_window,
+        )
+        matched = sum(1 for p in unique_pairs if p in soc_by_pair)
+        print(f"  SoC at Start: matched {matched}/{len(unique_pairs)} lookups")
+
+    missing_batteries = sorted({
+        pair[0] for pair in unique_pairs
+        if soc_by_pair.get(pair, (None, None))[0] is None
+    })
+    last_seen_by_id = {}
+    if missing_batteries:
+        print(f"  SoC at Start: checking last-ever-seen timestamp for "
+              f"{len(missing_batteries)} batteries with no reading found in window")
+        last_seen_by_id = get_last_seen(
+            missing_batteries, aws_profile=aws_profile, region=region, s3_output=s3_output,
+        )
+
+    new_rows = []
+    for r_idx, row in enumerate(rows):
+        row = list(row)
+        if r_idx == 0:
+            row.insert(started_col + 1, "SoC at Start (%)")
+        else:
+            target = row_targets[r_idx - 1]
+            if target is None:
+                soc = ""
+            else:
+                found = soc_by_pair.get(target)
+                if found is not None and found[0] is not None:
+                    soc = found[0]
+                else:
+                    last_seen = last_seen_by_id.get(target[0])
+                    soc = f"{NO_COMM_PREFIX}{last_seen}" if last_seen else BATTERY_OFFLINE_TEXT
+            row.insert(started_col + 1, soc)
         new_rows.append(row)
 
     return new_rows
@@ -629,15 +1473,39 @@ def auto_width(sheet):
         sheet.column_dimensions[col_letter].width = min(max_len + 4, 60)
 
 
-def write_data_sheet(wb, rows: list, has_header: bool = True):
+def write_data_sheet(wb, rows: list, has_header: bool = True, historical_age_days: float = None):
     ws = wb.active
     ws.title = "Data"
     headers = rows[0] if has_header else None
 
+    NO_DATA_COLUMNS = {"Recent SoC (%)", "Recent SoC Updated At", "SoC at Start (%)"}
+    days_since_idx = headers.index("Days Since Started") if headers and "Days Since Started" in headers else None
+
+    def is_no_data_placeholder(v):
+        return v == BATTERY_OFFLINE_TEXT or (isinstance(v, str) and v.startswith(NO_COMM_PREFIX))
+
+    def resolve_fill(r_idx, is_historical_row):
+        if is_historical_row:
+            return HISTORICAL_FILL
+        return ALT_FILL if r_idx % 2 == 0 else None
+
     for r_idx, row in enumerate(rows, start=1):
+        is_header_row = has_header and r_idx == 1
+        # Historical/overdue rows get a highlight fill across every cell,
+        # on top of already being sorted to the top by add_ageing_column —
+        # belt-and-braces so they're impossible to miss either way. There's
+        # no separate text flag column for this — re-derive it straight
+        # from 'Days Since Started' against the same threshold add_ageing_
+        # column sorted by.
+        is_historical_row = False
+        if not is_header_row and historical_age_days is not None and days_since_idx is not None and days_since_idx < len(row):
+            days_since = row[days_since_idx]
+            is_historical_row = isinstance(days_since, (int, float)) and days_since >= historical_age_days
+
         for c_idx, value in enumerate(row, start=1):
-            is_header_row = has_header and r_idx == 1
             header_name = headers[c_idx - 1] if headers and c_idx - 1 < len(headers) else None
+            is_blank = value is None or (isinstance(value, str) and value.strip() == "")
+            fill = resolve_fill(r_idx, is_historical_row)
 
             if is_header_row:
                 cell = ws.cell(row=r_idx, column=c_idx, value=str(value).strip())
@@ -646,13 +1514,39 @@ def write_data_sheet(wb, rows: list, has_header: bool = True):
                 cell.alignment = HEADER_ALIGN
                 continue
 
-            if header_name == "Date" and value != "":
-                cell = ws.cell(row=r_idx, column=c_idx, value=value)
-                cell.number_format = "dd mmm yyyy"
-            elif header_name == "Hour" and value != "":
+            # The hidden 'Date' helper column must stay a real date value
+            # (or genuinely blank) for the Pivot sheet's formulas to work —
+            # it's never shown to the user, so it's exempt from the
+            # no-data placeholders regardless of NO_DATA_COLUMNS.
+            if header_name == "Date":
+                cell = ws.cell(row=r_idx, column=c_idx, value=value if value != "" else None)
+                if value != "":
+                    cell.number_format = "dd mmm yyyy"
+                cell.font = DATA_FONT
+                if fill:
+                    cell.fill = fill
+                continue
+
+            # The SoC/timestamp columns get a no-data placeholder instead of
+            # a raw value: "Battery Offline/Disconnected" (no history at all)
+            # or "No Communication Since <ts>" (reported before, then went
+            # quiet) when add_recent_soc_column/add_soc_at_alert_time_column
+            # already resolved one of those; "No data provided" as a last
+            # resort for rows that were genuinely blank (e.g. no valid
+            # Battery id to check in the first place). Everywhere else, a
+            # blank cell stays genuinely blank, same as before.
+            if header_name in NO_DATA_COLUMNS and (is_blank or is_no_data_placeholder(value)):
+                text = value if is_no_data_placeholder(value) else NO_DATA_TEXT
+                cell = ws.cell(row=r_idx, column=c_idx, value=text)
+                cell.font = NO_DATA_FONT
+                if fill:
+                    cell.fill = fill
+                continue
+
+            if header_name in ("Hour", "Days Since Started") and not is_blank:
                 cell = ws.cell(row=r_idx, column=c_idx, value=int(value))
                 cell.number_format = "0"
-            elif header_name == "Recent SoC (%)" and value not in ("", None):
+            elif header_name in ("Recent SoC (%)", "SoC at Start (%)") and not is_blank:
                 try:
                     numeric_soc = float(value)
                     cell = ws.cell(row=r_idx, column=c_idx, value=numeric_soc)
@@ -662,12 +1556,15 @@ def write_data_sheet(wb, rows: list, has_header: bool = True):
             else:
                 cell = ws.cell(
                     row=r_idx, column=c_idx,
-                    value=str(value).strip() if value != "" else None
+                    value=str(value).strip() if not is_blank else None
                 )
 
-            cell.font = DATA_FONT
-            if r_idx % 2 == 0:
-                cell.fill = ALT_FILL
+            if header_name == "SoC Health" and isinstance(value, str) and value.startswith("Stuck at "):
+                cell.font = STUCK_SOC_FONT
+            else:
+                cell.font = DATA_FONT
+            if fill:
+                cell.fill = fill
 
     if has_header:
         ws.freeze_panes = "A2"
@@ -872,6 +1769,10 @@ def main():
                         help="Treat the first row as data, not a header")
     parser.add_argument("--no-region", action="store_true",
                         help="Skip automatic Region column extraction")
+    parser.add_argument("--no-odoo-region", action="store_true",
+                        help="Skip the Odoo fallback lookup for batteries with no "
+                             "Organisation Unit from the alert export (requires "
+                             "ODOO_URL/ODOO_DB/ODOO_USERNAME/ODOO_API_KEY to do anything anyway)")
     parser.add_argument("--lookup", default=None,
                         help="Path to a reference workbook (e.g. IP_Scrapped_data.xlsx) "
                              "whose first sheet maps 'Organisation Unit' -> "
@@ -881,6 +1782,11 @@ def main():
                         help="Skip automatic Pivot sheet")
     parser.add_argument("--no-soc", action="store_true",
                         help="Skip the automatic Recent SoC lookup from Athena")
+    parser.add_argument("--no-soc-at-start", action="store_true",
+                        help="Skip looking up the SoC reading at each alert's own Started At time")
+    parser.add_argument("--soc-at-start-window-hours", type=float, default=SOC_AT_START_WINDOW_HOURS,
+                        help="How many hours before each alert's Started At to search for a "
+                             "reading [env: ATHENA_SOC_AT_START_WINDOW_HOURS] (default: 2)")
     parser.add_argument("--aws-profile", default=DEFAULT_AWS_PROFILE,
                         help="Named AWS profile to use for the Athena query "
                              "[env: AWS_PROFILE] (default: boto3's default "
@@ -896,6 +1802,22 @@ def main():
     parser.add_argument("--soc-lookback-hours", type=float, default=SOC_LOOKBACK_HOURS,
                         help="How many hours back to scan for a 'recent' SoC "
                              "reading [env: ATHENA_SOC_LOOKBACK_HOURS] (default: 24)")
+    parser.add_argument("--no-ageing", action="store_true",
+                        help="Skip the 'Days Since Started' column and the "
+                             "historical-overdue sort/highlight")
+    parser.add_argument("--historical-age-days", type=float, default=HISTORICAL_AGE_DAYS,
+                        help="Alerts at least this many days old are flagged "
+                             "'Historical — overdue' and sorted to the top "
+                             "[env: HISTORICAL_AGE_DAYS] (default: 75)")
+    parser.add_argument("--no-stuck-soc", action="store_true",
+                        help="Skip the 'SoC Health' stuck-battery flag")
+    parser.add_argument("--stuck-soc-threshold-pct", type=float, default=STUCK_SOC_THRESHOLD_PCT,
+                        help="Recent SoC at/below this percent counts as 'low' "
+                             "[env: STUCK_SOC_THRESHOLD_PCT] (default: 5)")
+    parser.add_argument("--stuck-soc-min-days", type=float, default=STUCK_SOC_MIN_DAYS,
+                        help="Alert must be open at least this many days, still "
+                             "at/below the SoC threshold, to be flagged as stuck "
+                             "[env: STUCK_SOC_MIN_DAYS] (default: 14)")
     args = parser.parse_args()
 
     if not os.path.isfile(args.input):
@@ -916,14 +1838,43 @@ def main():
     rows = read_txt(args.input, delim)
     has_header = not args.no_header
 
+    if not args.no_soc_at_start:
+        rows = add_soc_at_alert_time_column(
+            rows, has_header,
+            aws_profile=args.aws_profile,
+            region=args.region,
+            s3_output=args.s3_output,
+            search_window_hours=args.soc_at_start_window_hours,
+        )
+
     region_lookup = None
     if args.lookup:
         if not os.path.isfile(args.lookup):
             sys.exit(f"Lookup file not found: {args.lookup}")
         region_lookup = load_region_lookup(args.lookup)
 
+    odoo_fallback = {}
+    odoo_configured = all([ODOO_URL, ODOO_DB, ODOO_USERNAME, ODOO_API_KEY])
+    if not args.no_region and not args.no_odoo_region and has_header and odoo_configured:
+        headers = rows[0]
+        if "Organisation Unit" in headers and BATTERY_COLUMN_NAME in headers:
+            org_col = headers.index("Organisation Unit")
+            battery_col = headers.index(BATTERY_COLUMN_NAME)
+            needs_odoo = sorted({
+                row[battery_col].strip()
+                for row in rows[1:]
+                if battery_col < len(row) and row[battery_col] and row[battery_col].strip()
+                and org_col < len(row) and _is_blank_or_dash(row[org_col])
+            })
+            if needs_odoo:
+                print(f"  Region: {len(needs_odoo)} batteries have no Organisation Unit from "
+                      f"the alert export — checking Odoo for a fallback")
+                odoo_fallback = get_odoo_region_fallback(needs_odoo)
+                matched = sum(1 for b in needs_odoo if b in odoo_fallback)
+                print(f"  Region: Odoo fallback resolved {matched}/{len(needs_odoo)}")
+
     if not args.no_region:
-        rows = add_region_column(rows, has_header, region_lookup=region_lookup)
+        rows = add_region_column(rows, has_header, region_lookup=region_lookup, odoo_fallback=odoo_fallback)
 
     if not args.no_pivot:
         rows = add_date_hour_columns(rows, has_header)
@@ -937,8 +1888,24 @@ def main():
             lookback_hours=args.soc_lookback_hours,
         )
 
+    if not args.no_stuck_soc:
+        rows = add_stuck_soc_flag(
+            rows, has_header,
+            soc_threshold_pct=args.stuck_soc_threshold_pct,
+            min_days=args.stuck_soc_min_days,
+        )
+
+    if not args.no_ageing:
+        rows = add_ageing_column(
+            rows, has_header,
+            historical_age_days=args.historical_age_days,
+        )
+
     wb = openpyxl.Workbook()
-    write_data_sheet(wb, rows, has_header=has_header)
+    write_data_sheet(
+        wb, rows, has_header=has_header,
+        historical_age_days=None if args.no_ageing else args.historical_age_days,
+    )
 
     pivot_ws = None
     if not args.no_pivot:

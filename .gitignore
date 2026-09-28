@@ -1,0 +1,12 @@
+.env
+*.txt
+*.log
+*.csv
+*.json
+*.xml
+*.db
+*.sqlite
+*.bak
+*.tmp
+.xlsx
+
