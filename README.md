@@ -105,3 +105,10 @@ data/results/
 ```
 
 Use `--no-region` to produce a single ungrouped workbook instead.
+
+## Continuous integration
+
+GitHub Actions runs on pushes, pull requests, and manual dispatch. It checks
+Python 3.10 and 3.14, installs the report dependencies, compiles the Python
+entry point and Snowflake configuration module, and smoke-tests the CLI help.
+These checks do not connect to Snowflake or require Odoo credentials.
