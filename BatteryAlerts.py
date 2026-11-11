@@ -16,7 +16,7 @@ Usage:
                                       [--no-ageing] [--historical-age-days DAYS]
                                       [--no-stuck-soc] [--stuck-soc-threshold-pct PCT]
                                       [--stuck-soc-min-days DAYS]
-                                      [--lookup FILE] [--aws-profile PROFILE]
+                                      [--lookup FILE]
 
 Arguments:
     input.txt       Path to the source text file (required)
@@ -27,7 +27,7 @@ Arguments:
     --no-odoo-region  Skip the Odoo fallback lookup for batteries with no
                     Organisation Unit from the alert export
     --no-pivot      Skip the automatic Pivot sheet
-    --no-soc        Skip the automatic Recent SoC lookup from Athena
+    --no-soc        Skip the automatic Recent SoC lookup from Snowflake
     --no-soc-at-start  Skip the SoC-at-alert-Started-At lookup
     --soc-at-start-window-hours  How far before each alert's Started At
                     to search for a reading (default: 2)
@@ -45,8 +45,6 @@ Arguments:
                     first sheet maps 'Organisation Unit' -> 'Parent
                     Organisation Unit'. Used to resolve Region first,
                     before falling back to dash-splitting.
-    --aws-profile   Named AWS profile to use for the Athena query
-                    (default: whatever boto3's default credential chain finds)
 
 Region extraction:
     Appends 'Region' and 'Sold-To Customer'. Region's resolution order,
@@ -95,62 +93,14 @@ Date extraction:
     in Excel if you want to see it.
 
 Recent SoC lookup:
-    Reads the distinct values in the 'Battery' column (e.g. "P14-000295")
-    and treats each as a device_serial. Runs a single live Athena query
-    against analytics.batteries_v3 (workgroup data_consumers) restricted
-    to the last 24 hours (configurable) that returns the most recent
-    reading per device_serial within that window (using sequence_number as
-    a tiebreaker for readings sharing the same time_stamp), then appends
-    two columns:
-      - "Recent SoC (%)"        — the latest state-of-charge reading
-      - "Recent SoC Updated At" — the timestamp of that reading
-    Batteries with no reading in the lookback window trigger a second,
-    unbounded "last-ever-seen" lookup so both columns can say which case
-    applies instead of just being left blank:
-      - "Battery Offline/Disconnected" if the battery has no history at
-        all in the table.
-      - "No Communication Since <timestamp>" if it reported before, using
-        its last-known reading's timestamp, however old.
-    The lookback window on the main query exists so it doesn't have to
-    scan the table's entire history to find the most recent row per
-    battery, which can otherwise time out on a large partitioned table.
-    Adjust it with --soc-lookback-hours or ATHENA_SOC_LOOKBACK_HOURS if
-    24h is too narrow for your fleet's reporting cadence.
-    Requires boto3 and valid AWS credentials (env vars, ~/.aws/credentials,
-    or --aws-profile). Skip with --no-soc if you don't want this (e.g. no
-    network access to AWS from this machine).
-
-    KNOWN ISSUE (as of July 2026): analytics.batteries_v3 currently takes
-    100+ seconds to run even trivial queries (confirmed via the Athena
-    console: a single-device lookup with LIMIT 1 scanned ~30 KB but took
-    over 2 minutes; a plain file-count query against the Iceberg
-    "$files" metadata table timed out entirely after ~30 minutes). This
-    points to the underlying table having an excessive number of small
-    files that haven't been compacted, despite its
-    'optimize_rewrite_data_file_threshold'='1' setting — this is a
-    data-platform/compaction issue, not something fixable from the query
-    side. If the Recent SoC lookup is consistently slow or timing out,
-    that's very likely why. Flag it to whoever owns the batteries_v3
-    pipeline (ask about running/scheduling OPTIMIZE ... EXECUTE) rather
-    than re-tuning this query further. Use --no-soc to skip the lookup
-    entirely in the meantime.
-
-    Configuration is read from environment variables, which can be set via
-    a .env file (loaded automatically with python-dotenv if it's installed)
-    in the working directory the script is run from — the same keys used
-    by the fleet-battery-report project's config.py, so both can share one
-    .env. Recognised keys, all optional:
-        ATHENA_DATABASE=analytics
-        ATHENA_TABLE=batteries_v3
-        ATHENA_WORKGROUP=data_consumers
-        ATHENA_BEM_ID_COL=device_serial
-        ATHENA_SOC_COL=soc
-        ATHENA_TIMESTAMP_COL=time_stamp
-        AWS_PROFILE=your-profile-name
-        AWS_REGION=af-south-1          (or AWS_DEFAULT_REGION)
-        ATHENA_S3_OUTPUT=s3://...      (omit to use the workgroup default)
-        ATHENA_SOC_LOOKBACK_HOURS=24   (how far back to scan for a recent reading)
-    See .env.example for a template.
+    Reads the distinct values in the 'Battery' column and uses them as
+    module serials in BALANCELL_DATA_PRODUCTION.TELEMETRY.TELEMETRY_MODULE.
+    It appends the latest STATE_OF_CHARGE and TIMESTAMP_MEASUREMENT within
+    the configured lookback window. Batteries with no reading in that
+    window get the same offline/no-communication status as before, based
+    on an unbounded last-seen lookup. Snowflake credentials are read from
+    .env; authentication uses the externalbrowser authenticator. Skip
+    these lookups with --no-soc or --no-soc-at-start.
 
 SoC at Start lookup:
     Separate from Recent SoC above. For each alert row, looks up the SoC
@@ -160,19 +110,15 @@ SoC at Start lookup:
     immediately after 'Started At':
       - "SoC at Start (%)"
     Requires both 'Battery' and 'Started At' columns. Searches up to
-    ATHENA_SOC_AT_START_WINDOW_HOURS (default 2h, --soc-at-start-window-hours)
-    before each alert's timestamp for the nearest reading at or before it.
+    --soc-at-start-window-hours (default 2h) before each alert's timestamp
+    for the nearest reading at or before it.
     Rows with a blank/'-' Battery or unparseable Started At are left
     blank. Rows with a valid Battery/Started At but no reading found in
     that window instead get the same "Battery Offline/Disconnected" /
     "No Communication Since <timestamp>" placeholder described above for
     Recent SoC, resolved from the same unbounded last-ever-seen lookup.
     Skip with --no-soc-at-start.
-    This runs as a SEPARATE Athena query from Recent SoC (matching up to
-    one row per unique alert timestamp instead of one row per battery),
-    so it adds its own runtime on top of whatever Recent SoC already
-    takes — and is subject to the same known batteries_v3 compaction
-    slowness described above.
+    This runs as a separate Snowflake query from Recent SoC.
 
 Ageing / historical-overdue flag:
     Appends "Days Since Started" — integer day count from Started At to
@@ -216,13 +162,11 @@ Examples:
     python txt_to_excel.py data.csv --delimiter comma
     python txt_to_excel.py data.tsv --delimiter tab
     python txt_to_excel.py data.txt --no-soc
-    python txt_to_excel.py data.txt --aws-profile balancell-analytics
 """
 
 import sys
 import os
 import re
-import time
 import shutil
 import argparse
 import xmlrpc.client
@@ -243,6 +187,8 @@ except ImportError:
     # whatever environment variables are already set (or the hardcoded
     # defaults below). Only needed if you actually want to use a .env file.
     pass
+
+from utils.config import get_snowflake_config
 
 
 DELIMITER_MAP = {
@@ -330,29 +276,11 @@ STUCK_SOC_THRESHOLD_PCT = float(os.getenv("STUCK_SOC_THRESHOLD_PCT", "5"))
 STUCK_SOC_MIN_DAYS      = float(os.getenv("STUCK_SOC_MIN_DAYS", "14"))
 
 # ---------------------------------------------------------------------------
-# Athena configuration — populated from environment variables (e.g. via a
-# .env file loaded by python-dotenv above), matching the same keys used by
-# the fleet-battery-report project's config.py. Every value is optional:
-# region and s3_output default to None (letting boto3/the AWS profile
-# decide), the rest fall back to the current hardcoded defaults if unset.
-#
-# .env keys recognised:
-#   ATHENA_DATABASE, ATHENA_TABLE, ATHENA_WORKGROUP,
-#   ATHENA_BEM_ID_COL, ATHENA_SOC_COL, ATHENA_TIMESTAMP_COL,
-#   AWS_PROFILE, AWS_REGION (or AWS_DEFAULT_REGION), ATHENA_S3_OUTPUT
+# Snowflake SoC lookup configuration.
 # ---------------------------------------------------------------------------
-ATHENA_WORKGROUP      = os.getenv("ATHENA_WORKGROUP", "data_consumers")
-ATHENA_DATABASE       = os.getenv("ATHENA_DATABASE", "analytics")
-ATHENA_TABLE          = os.getenv("ATHENA_TABLE", "batteries_v3")
-ATHENA_BEM_ID_COL     = os.getenv("ATHENA_BEM_ID_COL", "device_serial")  # matches the 'Battery' value, e.g. P14-000295
-ATHENA_SOC_COL        = os.getenv("ATHENA_SOC_COL", "soc")               # state-of-charge column (assumed 0-100 numeric)
-ATHENA_TIMESTAMP_COL  = os.getenv("ATHENA_TIMESTAMP_COL", "time_stamp")  # reading timestamp column
-ATHENA_HOUR_INSERTED_COL = os.getenv("ATHENA_HOUR_INSERTED_COL", "hour_inserted")  # ingestion-hour column (format YYYY-MM-DD-HH), used for file-level pruning since batteries_v3 is only partitioned by device_serial
-DEFAULT_AWS_PROFILE   = os.getenv("AWS_PROFILE")  # None if unset -> boto3's default credential chain
-DEFAULT_AWS_REGION    = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")  # None -> defer to profile/config
-DEFAULT_S3_OUTPUT     = os.getenv("ATHENA_S3_OUTPUT")  # None -> use the workgroup's own result location
-SOC_LOOKBACK_HOURS     = float(os.getenv("ATHENA_SOC_LOOKBACK_HOURS", "24"))  # how far back to scan for a "recent" reading
-SOC_AT_START_WINDOW_HOURS = float(os.getenv("ATHENA_SOC_AT_START_WINDOW_HOURS", "2"))  # how far before each alert's Started At to search for a reading
+SNOWFLAKE_MODULE_TABLE = "BALANCELL_DATA_PRODUCTION.TELEMETRY.TELEMETRY_MODULE"
+SOC_LOOKBACK_HOURS = float(os.getenv("SOC_LOOKBACK_HOURS", "24"))
+SOC_AT_START_WINDOW_HOURS = float(os.getenv("SOC_AT_START_WINDOW_HOURS", "2"))
 
 # ---------------------------------------------------------------------------
 # Odoo configuration — same env vars/pattern as the fleet-battery-report
@@ -368,8 +296,6 @@ ODOO_API_KEY  = os.getenv("ODOO_API_KEY")
 ODOO_BATCH_SIZE = 200
 
 BATTERY_COLUMN_NAME   = "Battery"    # column in the input .txt that holds the device_serial
-SOC_POLL_INTERVAL_SEC = 2.0
-SOC_POLL_TIMEOUT_SEC  = float(os.getenv("ATHENA_QUERY_TIMEOUT_SEC", "240"))
 
 
 def build_output_name(region: str = None) -> str:
@@ -951,268 +877,139 @@ def add_ageing_column(rows: list, has_header: bool, historical_age_days: float =
 
 
 # ---------------------------------------------------------------------------
-# Recent SoC lookup (Athena)
+# SoC lookup (Snowflake)
 # ---------------------------------------------------------------------------
 
-def _run_athena_query(
+def _run_snowflake_query(
     sql: str,
-    aws_profile: str = None,
-    region: str = None,
-    s3_output: str = None,
+    params: tuple | list,
 ) -> list:
-    """
-    Runs a query against Athena via boto3, polls until it finishes, and
-    returns the results as a list of dicts (one per row, keyed by column
-    name).
+    """Run a parameterized query against the configured Snowflake account."""
+    config = get_snowflake_config()
+    missing = [
+        name
+        for name, value in (
+            ("account", config.account),
+            ("user", config.username),
+            ("warehouse", config.warehouse),
+        )
+        if not value
+    ]
+    if missing:
+        raise ValueError(f"Missing Snowflake settings: {', '.join(missing)}")
 
-    Only passes region_name to the boto3 client if `region` is explicitly
-    given; otherwise defers to whatever the profile/AWS config already
-    specifies, to avoid region/credential mismatches. Same for s3_output:
-    only sets ResultConfiguration if explicitly given, otherwise relies on
-    the workgroup's own configured result location.
-    """
     try:
-        import boto3
-    except ImportError:
-        sys.exit(
-            "Missing dependency for --no-soc lookup. Run:  pip install boto3\n"
-            "Or pass --no-soc to skip the Athena Recent SoC lookup."
-        )
+        import snowflake.connector
+    except ImportError as exc:
+        raise ImportError(
+            "Snowflake SoC lookup requires snowflake-connector-python. "
+            "Install it with: pip install snowflake-connector-python"
+        ) from exc
 
-    session = boto3.Session(profile_name=aws_profile) if aws_profile else boto3.Session()
-    client = session.client("athena", region_name=region) if region else session.client("athena")
-
-    start_kwargs = {
-        "QueryString": sql,
-        "QueryExecutionContext": {"Database": ATHENA_DATABASE},
-        "WorkGroup": ATHENA_WORKGROUP,
+    connection_args = {
+        "account": config.account,
+        "user": config.username,
+        "warehouse": config.warehouse,
+        "database": "BALANCELL_DATA_PRODUCTION",
+        "schema": "TELEMETRY",
+        "authenticator": "externalbrowser",
     }
-    if s3_output:
-        start_kwargs["ResultConfiguration"] = {"OutputLocation": s3_output}
+    if config.role:
+        connection_args["role"] = config.role
 
-    start = client.start_query_execution(**start_kwargs)
-    query_id = start["QueryExecutionId"]
-    print(f"  Athena query started (QueryExecutionId={query_id}) — "
-          f"check the Athena console 'Recent queries' tab to watch it live")
-
-    elapsed = 0.0
-    last_reported = 0
-    while elapsed < SOC_POLL_TIMEOUT_SEC:
-        status = client.get_query_execution(QueryExecutionId=query_id)
-        state = status["QueryExecution"]["Status"]["State"]
-        if state == "SUCCEEDED":
-            stats = status["QueryExecution"].get("Statistics", {})
-            scanned_bytes = stats.get("DataScannedInBytes")
-            exec_ms = stats.get("EngineExecutionTimeInMillis")
-            if scanned_bytes is not None:
-                print(f"  Query succeeded — scanned {scanned_bytes / 1e6:.1f} MB "
-                      f"in {(exec_ms or 0) / 1000:.1f}s")
-            break
-        if state in ("FAILED", "CANCELLED"):
-            reason = status["QueryExecution"]["Status"].get("StateChangeReason", "unknown error")
-            sys.exit(f"Athena query {state.lower()}: {reason}")
-        if elapsed - last_reported >= 10:
-            print(f"  ...still running ({state}), {elapsed:.0f}s elapsed")
-            last_reported = elapsed
-        time.sleep(SOC_POLL_INTERVAL_SEC)
-        elapsed += SOC_POLL_INTERVAL_SEC
-    else:
-        sys.exit(
-            f"Athena query timed out after {SOC_POLL_TIMEOUT_SEC:.0f}s "
-            f"(QueryExecutionId={query_id}).\n"
-            f"Known issue: analytics.batteries_v3 has been observed taking "
-            f"100s-30min+ even for trivial single-device or metadata-only "
-            f"queries, likely due to an excessive number of small files "
-            f"that haven't been compacted. This is a data-platform issue, "
-            f"not something fixable by tuning this query further — flag it "
-            f"to whoever owns the batteries_v3 pipeline. In the meantime, "
-            f"rerun with --no-soc to skip this lookup, or raise "
-            f"ATHENA_QUERY_TIMEOUT_SEC in .env if you'd rather just wait "
-            f"longer."
-        )
-
-    results = []
-    columns = None
-    paginator = client.get_paginator("get_query_results")
-    for page in paginator.paginate(QueryExecutionId=query_id):
-        rows = page["ResultSet"]["Rows"]
-        if columns is None:
-            columns = [c.get("VarCharValue", "") for c in rows[0]["Data"]]
-            rows = rows[1:]  # skip header row on the first page only
-        for row in rows:
-            values = [cell.get("VarCharValue") for cell in row["Data"]]
-            results.append(dict(zip(columns, values)))
-
-    return results
+    connection = snowflake.connector.connect(**connection_args)
+    cursor = None
+    try:
+        cursor = connection.cursor()
+        cursor.execute(sql, params)
+        columns = [str(column[0]).lower() for column in cursor.description]
+        return [
+            dict(zip(columns, row))
+            for row in cursor.fetchall()
+        ]
+    finally:
+        try:
+            if cursor is not None:
+                cursor.close()
+        finally:
+            connection.close()
 
 
 def get_recent_soc(
     bem_ids: list,
-    aws_profile: str = None,
-    region: str = None,
-    s3_output: str = None,
     lookback_hours: float = None,
 ) -> dict:
-    """
-    Queries analytics.batteries_v3 for the most recent SoC reading per
-    bem_id in `bem_ids`, restricted to the last `lookback_hours` (default
-    SOC_LOOKBACK_HOURS) to avoid scanning the entire table history.
-
-    Matches the pattern used elsewhere in fleet_battery_report's query
-    builders:
-      - The time cutoff is computed here in Python and embedded as a
-        literal `timestamp '...'`, NOT `current_timestamp - INTERVAL`.
-        The latter is evaluated at query-execution time rather than
-        planning time, which can block Athena's partition pruning
-        entirely and force a full-table scan (this was the likely cause
-        of the previous timeout).
-      - Rows are deduplicated first via max_by(soc, time_received)
-        GROUP BY device_serial, bem_id, sequence_number (same as
-        missed_opportunity_charging's `deduplicated` CTE), before
-        picking the most recent per device_serial.
-      - An additional `hour_inserted >= '<cutoff hour>'` filter is added
-        alongside the time_stamp filter. batteries_v3 is only PARTITIONED
-        BY device_serial, so a time_stamp-only filter still forces a scan
-        of every file in that device's entire partition history.
-        hour_inserted marks the ingestion hour, and files are written (and
-        very likely clustered) in ingestion order, so filtering on it lets
-        Iceberg's file-level min/max stats actually skip files. This is
-        safe (never excludes a row we want) because a record can't be
-        received before it was generated, so time_received — and
-        therefore hour_inserted — is always >= time_stamp.
-      - There's also an upper bound, `time_stamp <= <now>`. batteries_v3
-        has been observed (e.g. device P16-000097) returning corrupt rows
-        stamped with impossible future dates like 2112-01-01. Without an
-        upper bound, ORDER BY time_stamp DESC always ranks such a row
-        first, permanently shadowing the device's real recent reading.
-        Real readings can't be timestamped in the future, so this filter
-        never excludes a row we'd actually want.
-
-    Returns {bem_id: (soc_str, timestamp_str)}. bem_ids not found within
-    the lookback window are simply absent from the returned dict.
-    """
+    """Return each module's latest SoC and measurement time in the lookback window."""
     if not bem_ids:
         return {}
-
     if lookback_hours is None:
         lookback_hours = SOC_LOOKBACK_HOURS
 
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     cutoff = now - timedelta(hours=lookback_hours)
-    now_literal = now.strftime("%Y-%m-%d %H:%M:%S")
-    cutoff_literal = cutoff.strftime("%Y-%m-%d %H:%M:%S")
-    cutoff_hour_literal = cutoff.strftime("%Y-%m-%d-%H")
-
-    # Escape single quotes defensively, then quote each id for the IN list.
-    quoted_ids = ", ".join("'" + bid.replace("'", "''") + "'" for bid in bem_ids)
-
+    placeholders = ", ".join(["%s"] * len(bem_ids))
     sql = f"""
-        WITH deduplicated AS (
-            SELECT
-                {ATHENA_BEM_ID_COL},
-                bem_id,
-                sequence_number,
-                max_by({ATHENA_SOC_COL}, time_received) AS {ATHENA_SOC_COL},
-                CAST(max_by({ATHENA_TIMESTAMP_COL}, time_received) AS timestamp) AS {ATHENA_TIMESTAMP_COL}
-            FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
-            WHERE {ATHENA_BEM_ID_COL} IN ({quoted_ids})
-              AND {ATHENA_HOUR_INSERTED_COL} >= '{cutoff_hour_literal}'
-              AND {ATHENA_TIMESTAMP_COL} >= timestamp '{cutoff_literal}'
-              AND {ATHENA_TIMESTAMP_COL} <= timestamp '{now_literal}'
-            GROUP BY {ATHENA_BEM_ID_COL}, bem_id, sequence_number
-        ),
-        ranked AS (
-            SELECT *,
-                ROW_NUMBER() OVER (
-                    PARTITION BY {ATHENA_BEM_ID_COL}
-                    ORDER BY {ATHENA_TIMESTAMP_COL} DESC, sequence_number DESC
-                ) AS rn
-            FROM deduplicated
-        )
-        SELECT {ATHENA_BEM_ID_COL}, {ATHENA_SOC_COL}, {ATHENA_TIMESTAMP_COL}
-        FROM ranked
-        WHERE rn = 1
+        SELECT
+            MODULE_SERIAL AS DEVICE_SERIAL,
+            STATE_OF_CHARGE AS SOC,
+            TIMESTAMP_MEASUREMENT AS TIME_STAMP
+        FROM {SNOWFLAKE_MODULE_TABLE}
+        WHERE MODULE_SERIAL IN ({placeholders})
+          AND TIMESTAMP_MEASUREMENT >= %s
+          AND TIMESTAMP_MEASUREMENT <= %s
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY MODULE_SERIAL
+            ORDER BY TIMESTAMP_MEASUREMENT DESC, BEM_SEQUENCE_NUMBER DESC
+        ) = 1
     """
-
-    rows = _run_athena_query(sql, aws_profile=aws_profile, region=region, s3_output=s3_output)
-
+    rows = _run_snowflake_query(sql, (*bem_ids, cutoff, now))
     soc_by_id = {}
-    for r in rows:
-        bem_id = r.get(ATHENA_BEM_ID_COL)
+    for row in rows:
+        bem_id = row.get("device_serial")
         if bem_id:
-            soc_by_id[bem_id] = (r.get(ATHENA_SOC_COL), r.get(ATHENA_TIMESTAMP_COL))
-
+            soc = row.get("soc")
+            timestamp = row.get("time_stamp")
+            soc_by_id[bem_id] = (
+                str(soc) if soc is not None else None,
+                str(timestamp) if timestamp is not None else None,
+            )
     return soc_by_id
 
 
-def get_last_seen(
-    bem_ids: list,
-    aws_profile: str = None,
-    region: str = None,
-    s3_output: str = None,
-) -> dict:
-    """
-    For each bem_id in `bem_ids`, finds the single most recent time_stamp
-    it has EVER reported — no lookback window (unlike get_recent_soc/
-    get_soc_at_timestamps, deliberately no hour_inserted/time_stamp LOWER
-    bound, since the whole point is to find readings that may be far
-    outside any lookback window). This is what lets a battery that has
-    simply gone quiet (present here, with an old timestamp) be told apart
-    from one that has never reported at all (absent from the result
-    entirely).
-
-    Does still cap time_stamp at "now": batteries_v3 has been observed
-    (e.g. device P16-000097) returning rows corrupted with impossible
-    future dates like 2112-01-01, and MAX(time_stamp) with no upper bound
-    would report that garbage value as the "last seen" reading. A real
-    reading can't be timestamped in the future, so this never excludes a
-    row we'd actually want.
-
-    Only call this for the (typically small) set of bem_ids that already
-    missed a windowed lookup elsewhere, so the full-history scan stays
-    cheap.
-
-    Returns {bem_id: last_seen_timestamp_str}. bem_ids with no reading in
-    the table at all are simply absent from the returned dict.
-    """
+def get_last_seen(bem_ids: list) -> dict:
+    """Return each requested module's latest measurement timestamp, if any."""
     if not bem_ids:
         return {}
 
-    now_literal = datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
-    quoted_ids = ", ".join("'" + bid.replace("'", "''") + "'" for bid in bem_ids)
-
+    placeholders = ", ".join(["%s"] * len(bem_ids))
     sql = f"""
-        SELECT {ATHENA_BEM_ID_COL} AS bem_id, MAX({ATHENA_TIMESTAMP_COL}) AS last_seen
-        FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
-        WHERE {ATHENA_BEM_ID_COL} IN ({quoted_ids})
-          AND {ATHENA_TIMESTAMP_COL} <= timestamp '{now_literal}'
-        GROUP BY {ATHENA_BEM_ID_COL}
+        SELECT MODULE_SERIAL AS DEVICE_SERIAL, MAX(TIMESTAMP_MEASUREMENT) AS LAST_SEEN
+        FROM {SNOWFLAKE_MODULE_TABLE}
+        WHERE MODULE_SERIAL IN ({placeholders})
+          AND TIMESTAMP_MEASUREMENT <= %s
+        GROUP BY MODULE_SERIAL
     """
-
-    rows = _run_athena_query(sql, aws_profile=aws_profile, region=region, s3_output=s3_output)
-
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    rows = _run_snowflake_query(sql, (*bem_ids, now))
     last_seen_by_id = {}
-    for r in rows:
-        bem_id = r.get("bem_id")
+    for row in rows:
+        bem_id = row.get("device_serial")
         if bem_id:
-            last_seen_by_id[bem_id] = r.get("last_seen")
-
+            timestamp = row.get("last_seen")
+            last_seen_by_id[bem_id] = str(timestamp) if timestamp is not None else None
     return last_seen_by_id
 
 
 def add_recent_soc_column(
     rows: list,
     has_header: bool,
-    aws_profile: str = None,
-    region: str = None,
-    s3_output: str = None,
     lookback_hours: float = None,
 ) -> list:
     """
     Appends 'Recent SoC (%)' and 'Recent SoC Updated At' columns, keyed
     on the 'Battery' column (treated as bem_id). Blank/placeholder ('-')
     Battery values are left blank in both columns. Batteries with a real
-    id but no reading in Athena within the lookback window get a
+    id but no reading in Snowflake within the lookback window get a
     no-data placeholder in both columns instead — "Battery
     Offline/Disconnected" if they have never reported at all, or
     "No Communication Since <timestamp>" (their last-ever-seen reading)
@@ -1237,16 +1034,11 @@ def add_recent_soc_column(
     })
 
     effective_lookback = SOC_LOOKBACK_HOURS if lookback_hours is None else lookback_hours
-    print(f"  Recent SoC: looking up {len(bem_ids)} batteries from Athena "
-          f"(last {effective_lookback:g}h) — note: analytics.batteries_v3 has "
-          f"a known compaction/small-files issue that can make even trivial "
-          f"queries slow; this may take a while")
-    soc_by_id = get_recent_soc(
-        bem_ids, aws_profile=aws_profile, region=region, s3_output=s3_output,
-        lookback_hours=effective_lookback,
-    )
+    print(f"  Recent SoC: looking up {len(bem_ids)} batteries in Snowflake "
+          f"(last {effective_lookback:g}h)")
+    soc_by_id = get_recent_soc(bem_ids, lookback_hours=effective_lookback)
     matched = sum(1 for bid in bem_ids if bid in soc_by_id)
-    print(f"  Recent SoC: matched {matched}/{len(bem_ids)} batteries in Athena "
+    print(f"  Recent SoC: matched {matched}/{len(bem_ids)} batteries in Snowflake "
           f"(last {effective_lookback:g}h)")
 
     missing_ids = [bid for bid in bem_ids if bid not in soc_by_id]
@@ -1255,9 +1047,7 @@ def add_recent_soc_column(
         print(f"  Recent SoC: checking last-ever-seen timestamp for "
               f"{len(missing_ids)} batteries with no reading in the last "
               f"{effective_lookback:g}h")
-        last_seen_by_id = get_last_seen(
-            missing_ids, aws_profile=aws_profile, region=region, s3_output=s3_output,
-        )
+        last_seen_by_id = get_last_seen(missing_ids)
 
     new_rows = []
     for r_idx, row in enumerate(rows):
@@ -1302,7 +1092,7 @@ def add_stuck_soc_flag(
     Recent SoC, and today minus Started At), not a scan of the battery's
     full SoC history — it can't tell "flat at 0% the entire time" apart
     from "recovered partway through and dropped back to 0% again". If
-    that distinction matters, it needs its own Athena query (MIN/MAX SoC
+    that distinction matters, it needs its own Snowflake query (MIN/MAX SoC
     over the alert's lifetime) rather than reusing this column.
 
     Must run after add_recent_soc_column (needs 'Recent SoC (%)') and
@@ -1360,22 +1150,18 @@ def add_stuck_soc_flag(
 
 def get_soc_at_timestamps(
     pairs: list,
-    aws_profile: str = None,
-    region: str = None,
-    s3_output: str = None,
     search_window_hours: float = None,
 ) -> dict:
     """
     For each (device_serial, target_dt) pair in `pairs`, finds the most
     recent SoC reading at or before target_dt, searching back up to
     `search_window_hours` (default SOC_AT_START_WINDOW_HOURS) in case
-    there's a gap right at that moment. Uses a single Athena query built
-    from a VALUES list covering every pair at once.
+    there's a gap right at that moment. Uses one parameterized Snowflake
+    query covering every pair.
 
     Each pair is matched back by a synthetic integer index rather than by
-    round-tripping the timestamp through Athena's string formatting (which
-    can add trailing zeros/microseconds), so there's no ambiguity matching
-    results back to the original (device_serial, target_dt) keys.
+    round-tripping the timestamp through SQL formatting, so there is no
+    ambiguity matching results back to the original keys.
 
     Returns {(device_serial, target_dt): (soc_str, time_stamp_str)}. Pairs
     with no reading found in the window are simply absent from the dict.
@@ -1385,69 +1171,57 @@ def get_soc_at_timestamps(
 
     if search_window_hours is None:
         search_window_hours = SOC_AT_START_WINDOW_HOURS
-    window_minutes = max(1, round(search_window_hours * 60))
-
-    values_list = ",\n            ".join(
-        f"({idx}, '{dev.replace(chr(39), chr(39) * 2)}', "
-        f"TIMESTAMP '{dt.strftime('%Y-%m-%d %H:%M:%S')}')"
-        for idx, (dev, dt) in enumerate(pairs)
-    )
-
-    # Global bounds across all targets, used only to help Athena/Iceberg
-    # skip files — correctness comes from the per-row
-    # b.time_stamp <= t.target_ts join condition below, not from these.
-    earliest_target = min(dt for _, dt in pairs)
-    latest_target = max(dt for _, dt in pairs)
-    global_lower = earliest_target - timedelta(hours=search_window_hours)
-    global_hour_inserted_floor = global_lower.strftime("%Y-%m-%d-%H")
-    global_time_stamp_floor = global_lower.strftime("%Y-%m-%d %H:%M:%S")
-    global_time_stamp_ceiling = latest_target.strftime("%Y-%m-%d %H:%M:%S")
+    window_minutes = -max(1, round(search_window_hours * 60))
+    target_rows = [
+        f"SELECT %s AS IDX, %s AS DEVICE_SERIAL, %s AS TARGET_TS"
+        for _ in pairs
+    ]
+    params = [
+        value
+        for idx, (serial, target_dt) in enumerate(pairs)
+        for value in (idx, serial, target_dt)
+    ]
+    params.append(window_minutes)
 
     sql = f"""
-        WITH targets (idx, device_serial, target_ts) AS (
-            VALUES
-            {values_list}
-        ),
-        candidates AS (
-            SELECT
-                t.idx,
-                b.bem_id,
-                b.sequence_number,
-                max_by(b.{ATHENA_SOC_COL}, b.time_received) AS soc,
-                CAST(max_by(b.{ATHENA_TIMESTAMP_COL}, b.time_received) AS timestamp) AS time_stamp
-            FROM targets t
-            JOIN {ATHENA_DATABASE}.{ATHENA_TABLE} b
-              ON b.{ATHENA_BEM_ID_COL} = t.device_serial
-             AND b.{ATHENA_TIMESTAMP_COL} <= t.target_ts
-             AND b.{ATHENA_TIMESTAMP_COL} >= t.target_ts - INTERVAL '{window_minutes}' MINUTE
-             AND b.{ATHENA_HOUR_INSERTED_COL} >= '{global_hour_inserted_floor}'
-             AND b.{ATHENA_TIMESTAMP_COL} >= timestamp '{global_time_stamp_floor}'
-             AND b.{ATHENA_TIMESTAMP_COL} <= timestamp '{global_time_stamp_ceiling}'
-            GROUP BY t.idx, b.bem_id, b.sequence_number
+        WITH targets AS (
+            {" UNION ALL ".join(target_rows)}
         ),
         ranked AS (
-            SELECT *,
+            SELECT
+                t.idx,
+                m.STATE_OF_CHARGE AS SOC,
+                m.TIMESTAMP_MEASUREMENT AS TIME_STAMP,
                 ROW_NUMBER() OVER (
-                    PARTITION BY idx
-                    ORDER BY time_stamp DESC, sequence_number DESC
-                ) AS rn
-            FROM candidates
+                    PARTITION BY t.idx
+                    ORDER BY m.TIMESTAMP_MEASUREMENT DESC, m.BEM_SEQUENCE_NUMBER DESC
+                ) AS RN
+            FROM targets t
+            JOIN {SNOWFLAKE_MODULE_TABLE} m
+              ON m.MODULE_SERIAL = t.device_serial
+             AND m.TIMESTAMP_MEASUREMENT <= t.target_ts
+             AND m.TIMESTAMP_MEASUREMENT >= DATEADD(minute, %s, t.target_ts)
         )
         SELECT idx, soc, time_stamp
         FROM ranked
         WHERE rn = 1
     """
 
-    rows = _run_athena_query(sql, aws_profile=aws_profile, region=region, s3_output=s3_output)
+    rows = _run_snowflake_query(sql, params)
 
     result = {}
-    for r in rows:
-        idx_raw = r.get("idx")
+    for row in rows:
+        idx_raw = row.get("idx")
         if idx_raw is None:
             continue
         idx = int(idx_raw)
         if 0 <= idx < len(pairs):
-            result[pairs[idx]] = (r.get("soc"), r.get("time_stamp"))
+            soc = row.get("soc")
+            timestamp = row.get("time_stamp")
+            result[pairs[idx]] = (
+                str(soc) if soc is not None else None,
+                str(timestamp) if timestamp is not None else None,
+            )
 
     return result
 
@@ -1455,9 +1229,6 @@ def get_soc_at_timestamps(
 def add_soc_at_alert_time_column(
     rows: list,
     has_header: bool,
-    aws_profile: str = None,
-    region: str = None,
-    s3_output: str = None,
     search_window_hours: float = None,
 ) -> list:
     """
@@ -1489,7 +1260,7 @@ def add_soc_at_alert_time_column(
     data_rows = rows[1:]
 
     # Build the (device_serial, target_dt) each row needs, and the
-    # deduplicated set of unique pairs to actually query Athena for.
+    # deduplicated set of unique pairs to actually query Snowflake for.
     row_targets = []
     seen_pairs = {}
     for row in data_rows:
@@ -1514,13 +1285,10 @@ def add_soc_at_alert_time_column(
     else:
         effective_window = SOC_AT_START_WINDOW_HOURS if search_window_hours is None else search_window_hours
         print(f"  SoC at Start: looking up {len(unique_pairs)} unique battery/time "
-              f"combinations from Athena (searching up to {effective_window:g}h "
-              f"before each alert) — note: analytics.batteries_v3 has a known "
-              f"compaction/small-files issue that can make even trivial "
-              f"queries slow; this may take a while")
+              f"combinations in Snowflake (searching up to {effective_window:g}h "
+              f"before each alert)")
         soc_by_pair = get_soc_at_timestamps(
-            unique_pairs, aws_profile=aws_profile, region=region, s3_output=s3_output,
-            search_window_hours=effective_window,
+            unique_pairs, search_window_hours=effective_window,
         )
         matched = sum(1 for p in unique_pairs if p in soc_by_pair)
         print(f"  SoC at Start: matched {matched}/{len(unique_pairs)} lookups")
@@ -1533,9 +1301,7 @@ def add_soc_at_alert_time_column(
     if missing_batteries:
         print(f"  SoC at Start: checking last-ever-seen timestamp for "
               f"{len(missing_batteries)} batteries with no reading found in window")
-        last_seen_by_id = get_last_seen(
-            missing_batteries, aws_profile=aws_profile, region=region, s3_output=s3_output,
-        )
+        last_seen_by_id = get_last_seen(missing_batteries)
 
     new_rows = []
     for r_idx, row in enumerate(rows):
@@ -1883,27 +1649,15 @@ def main():
     parser.add_argument("--no-pivot", action="store_true",
                         help="Skip automatic Pivot sheet")
     parser.add_argument("--no-soc", action="store_true",
-                        help="Skip the automatic Recent SoC lookup from Athena")
+                        help="Skip the automatic Recent SoC lookup from Snowflake")
     parser.add_argument("--no-soc-at-start", action="store_true",
                         help="Skip looking up the SoC reading at each alert's own Started At time")
     parser.add_argument("--soc-at-start-window-hours", type=float, default=SOC_AT_START_WINDOW_HOURS,
                         help="How many hours before each alert's Started At to search for a "
-                             "reading [env: ATHENA_SOC_AT_START_WINDOW_HOURS] (default: 2)")
-    parser.add_argument("--aws-profile", default=DEFAULT_AWS_PROFILE,
-                        help="Named AWS profile to use for the Athena query "
-                             "[env: AWS_PROFILE] (default: boto3's default "
-                             "credential chain if unset)")
-    parser.add_argument("--region", default=DEFAULT_AWS_REGION,
-                        help="AWS region for the Athena client "
-                             "[env: AWS_REGION or AWS_DEFAULT_REGION] "
-                             "(default: deferred to the profile/AWS config)")
-    parser.add_argument("--s3-output", default=DEFAULT_S3_OUTPUT,
-                        help="S3 URI for Athena query results "
-                             "[env: ATHENA_S3_OUTPUT] "
-                             "(default: the workgroup's own result location)")
+                             "reading [env: SOC_AT_START_WINDOW_HOURS] (default: 2)")
     parser.add_argument("--soc-lookback-hours", type=float, default=SOC_LOOKBACK_HOURS,
                         help="How many hours back to scan for a 'recent' SoC "
-                             "reading [env: ATHENA_SOC_LOOKBACK_HOURS] (default: 24)")
+                             "reading [env: SOC_LOOKBACK_HOURS] (default: 24)")
     parser.add_argument("--no-ageing", action="store_true",
                         help="Skip the 'Days Since Started' column and the "
                              "historical-overdue sort/highlight")
@@ -1925,9 +1679,6 @@ def main():
     if not os.path.isfile(args.input):
         sys.exit(f"File not found: {args.input}")
 
-    # Place output(s) in the same directory as the input file
-    input_dir = os.path.dirname(os.path.abspath(args.input))
-
     # Resolve delimiter
     delim = args.delimiter
     if delim and delim.lower() in DELIMITER_MAP:
@@ -1939,9 +1690,6 @@ def main():
     if not args.no_soc_at_start:
         rows = add_soc_at_alert_time_column(
             rows, has_header,
-            aws_profile=args.aws_profile,
-            region=args.region,
-            s3_output=args.s3_output,
             search_window_hours=args.soc_at_start_window_hours,
         )
 
@@ -1980,9 +1728,6 @@ def main():
     if not args.no_soc:
         rows = add_recent_soc_column(
             rows, has_header,
-            aws_profile=args.aws_profile,
-            region=args.region,
-            s3_output=args.s3_output,
             lookback_hours=args.soc_lookback_hours,
         )
 
@@ -2006,7 +1751,8 @@ def main():
 
     # All of today's per-Region files go into one dated folder, which is
     # then zipped so the whole day's output can be shared as one file.
-    output_folder = os.path.join(input_dir, build_output_folder_name())
+    output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "results")
+    output_folder = os.path.join(output_dir, build_output_folder_name())
     os.makedirs(output_folder, exist_ok=True)
 
     print(f"Done! {len(rows)} rows written to {output_folder}/:")
@@ -2031,7 +1777,7 @@ def main():
         elif not args.no_pivot:
             print("    (No Pivot sheet: couldn't find Date/Type columns)")
 
-    zip_path = shutil.make_archive(output_folder, "zip", root_dir=input_dir, base_dir=os.path.basename(output_folder))
+    zip_path = shutil.make_archive(output_folder, "zip", root_dir=output_dir, base_dir=os.path.basename(output_folder))
     print(f"  Zipped: {zip_path}")
 
 
