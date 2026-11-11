@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-txt_to_excel.py — Convert a plain-text file to an Excel spreadsheet.
+BatteryAlerts.py — Convert a plain-text file to an Excel spreadsheet.
 
-Output is automatically named:  Battery_Alert_<Day>_<DD>_<Month>_<YYYY>.xlsx
+Output is split into one file per Region, all placed in a per-day folder
+(and zipped alongside it) named:  Battery_Alert_<Day>_<DD>_<Month>_<YYYY>
+Each file inside is named:        Battery_Alert_<Day>_<DD>_<Month>_<YYYY>_<Region>.xlsx
+Rows with no Region resolved land in a "..._Unspecified.xlsx" file. If
+Region extraction is skipped (--no-region), the folder holds a single
+ungrouped file instead: Battery_Alert_<Day>_<DD>_<Month>_<YYYY>.xlsx
 
 Usage:
-    python txt_to_excel.py input.txt [--delimiter DELIM] [--no-header] [--no-region]
+    python BatteryAlerts.py input.txt [--delimiter DELIM] [--no-header] [--no-region]
                                       [--no-pivot] [--no-soc] [--no-soc-at-start]
                                       [--soc-at-start-window-hours HOURS]
                                       [--no-ageing] [--historical-age-days DAYS]
@@ -218,6 +223,7 @@ import sys
 import os
 import re
 import time
+import shutil
 import argparse
 import xmlrpc.client
 from datetime import datetime, timedelta, timezone
@@ -247,6 +253,57 @@ DELIMITER_MAP = {
 }
 
 REGION_SPLIT = " - "
+
+# City/area abbreviations that sometimes appear inside a free-text
+# 'Sold-To Customer' value (e.g. "TFL(TSAM)_DBN", "HOUSE OF FIBRE - EC")
+# when Organisation Unit itself was blank/'-'. Maps each abbreviation to
+# the Region it stands for. Matched case-insensitively on whole words
+# only, so e.g. "PEACH" is never mistaken for "PE".
+SOLD_TO_REGION_ABBREVIATIONS = {
+    "JHB": "Industrial Power Gauteng",
+    "DBN": "Industrial Power Kwazulu Natal",
+    "EC":  "Industrial Power Eastern Cape",
+    "PE":  "Industrial Power Eastern Cape",
+    "CPT": "Industrial Power Western Cape",
+    "WCP": "Industrial Power Western Cape",
+    "WC":  "Industrial Power Western Cape",
+    "KZN": "Industrial Power Kwazulu Natal",
+    "ECPT": "Industrial Power Eastern Cape",
+    "BLOEM": "Industrial Power Free State",
+    "FS": "Industrial Power Free State",
+    "PTA": "Industrial Power Gauteng",
+    "GAUTENG": "Industrial Power Gauteng",
+    "MPUMALANGA": "Industrial Power Mpumalanga",
+    "MP": "Industrial Power Mpumalanga",
+    "LIMPOPO": "Industrial Power Limpopo",
+    "LP": "Industrial Power Limpopo",
+    "NORTH WEST": "Industrial Power North West",
+    "NORTHERN CAPE": "Industrial Power Northern Cape",
+    "NC": "Industrial Power Northern Cape",
+    "EASTERN CAPE": "Industrial Power Eastern Cape",
+    "WESTERN CAPE": "Industrial Power Western Cape",
+    "KWAZULU NATAL": "Industrial Power Kwazulu Natal",
+    "KZN": "Industrial Power Kwazulu Natal",
+    "FREE STATE": "Industrial Power Free State",
+    "FS": "Industrial Power Free State",
+}
+_SOLD_TO_REGION_RE = re.compile(
+    r"(?<![A-Za-z])(" + "|".join(SOLD_TO_REGION_ABBREVIATIONS) + r")(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+
+def region_from_sold_to_customer(text: str) -> str:
+    """
+    Scans a 'Sold-To Customer' free-text value for a known city
+    abbreviation (see SOLD_TO_REGION_ABBREVIATIONS) and returns the
+    matching Region, or "" if none is found. Used only as a last-resort
+    fallback when Region couldn't be resolved any other way.
+    """
+    if not text:
+        return ""
+    match = _SOLD_TO_REGION_RE.search(text)
+    return SOLD_TO_REGION_ABBREVIATIONS[match.group(1).upper()] if match else ""
 DATETIME_FORMAT = "%d %b %Y, %H:%M"  # e.g. "15 Jul 2026, 10:38"
 
 HEADER_FONT  = Font(name="Arial", bold=True, color="FFFFFF")
@@ -315,10 +372,49 @@ SOC_POLL_INTERVAL_SEC = 2.0
 SOC_POLL_TIMEOUT_SEC  = float(os.getenv("ATHENA_QUERY_TIMEOUT_SEC", "240"))
 
 
-def build_output_name() -> str:
-    """Return Battery_Alert_<Weekday>_<DD>_<Month>_<YYYY>.xlsx using today's date."""
+def build_output_name(region: str = None) -> str:
+    """
+    Return Battery_Alert_<Weekday>_<DD>_<Month>_<YYYY>.xlsx using today's
+    date, or Battery_Alert_<Weekday>_<DD>_<Month>_<YYYY>_<Region>.xlsx
+    when a region is given (spaces replaced with underscores to match the
+    rest of the naming convention).
+    """
     now = datetime.now()
-    return now.strftime("Battery_Alert_%A_%d_%B_%Y.xlsx")
+    base = now.strftime("Battery_Alert_%A_%d_%B_%Y")
+    if region:
+        base += "_" + re.sub(r"\s+", "_", region.strip())
+    return base + ".xlsx"
+
+
+UNSPECIFIED_REGION_LABEL = "Unspecified"
+
+
+def build_output_folder_name() -> str:
+    """Return Battery_Alert_<Weekday>_<DD>_<Month>_<YYYY> (no extension) using today's date."""
+    return datetime.now().strftime("Battery_Alert_%A_%d_%B_%Y")
+
+
+def split_rows_by_region(rows: list, has_header: bool) -> dict:
+    """
+    Splits data rows into {Region: rows_with_header} groups using the
+    'Region' column (added by add_region_column). Rows with a blank
+    Region are grouped under UNSPECIFIED_REGION_LABEL rather than
+    dropped. Returns {} if there's no header or no 'Region' column to
+    key off of.
+    """
+    if not has_header or not rows:
+        return {}
+    headers = rows[0]
+    if "Region" not in headers:
+        return {}
+    region_col = headers.index("Region")
+
+    groups = {}
+    for row in rows[1:]:
+        region = row[region_col].strip() if region_col < len(row) and row[region_col] else ""
+        groups.setdefault(region or UNSPECIFIED_REGION_LABEL, []).append(row)
+
+    return {region: [headers] + group_rows for region, group_rows in groups.items()}
 
 
 def detect_delimiter(lines: list) -> str:
@@ -460,7 +556,11 @@ def add_region_column(
          look up the row's 'Battery' serial in it — see
          get_odoo_region_fallback for how that's built — and dash-split
          the resolved name the same way as (2), IF it has a dash.
-      4. Otherwise Region is left blank.
+      4. If still blank and a 'Sold-To Customer' value (customer_reference)
+         is available, scan it for a known city abbreviation (JHB, DBN,
+         EC, PE — see SOLD_TO_REGION_ABBREVIATIONS) and use its mapped
+         Region.
+      5. Otherwise Region is left blank.
 
     Odoo's resolved name (odoo_fallback[battery]["name"]) is used ONLY
     for that dash-split — it's often a full legal customer name (e.g.
@@ -515,6 +615,8 @@ def add_region_column(
                     customer_reference = odoo_match.get("customer_reference")
                 if not region and odoo_name and REGION_SPLIT in odoo_name:
                     region = odoo_name.split(REGION_SPLIT, 1)[1].strip()
+                if not region and customer_reference:
+                    region = region_from_sold_to_customer(customer_reference)
 
             row.append(region)
             row.append(customer_reference or "")
@@ -1823,12 +1925,8 @@ def main():
     if not os.path.isfile(args.input):
         sys.exit(f"File not found: {args.input}")
 
-    # Auto-generate output filename
-    output_path = build_output_name()
-
-    # Place the output in the same directory as the input file
+    # Place output(s) in the same directory as the input file
     input_dir = os.path.dirname(os.path.abspath(args.input))
-    output_path = os.path.join(input_dir, output_path)
 
     # Resolve delimiter
     delim = args.delimiter
@@ -1901,24 +1999,40 @@ def main():
             historical_age_days=args.historical_age_days,
         )
 
-    wb = openpyxl.Workbook()
-    write_data_sheet(
-        wb, rows, has_header=has_header,
-        historical_age_days=None if args.no_ageing else args.historical_age_days,
-    )
+    region_groups = split_rows_by_region(rows, has_header)
+    # Fall back to a single ungrouped file if there's no Region column to
+    # split on (e.g. --no-region was passed).
+    outputs = region_groups or {None: rows}
 
-    pivot_ws = None
-    if not args.no_pivot:
-        pivot_ws = add_pivot_sheet(wb, rows, has_header)
+    # All of today's per-Region files go into one dated folder, which is
+    # then zipped so the whole day's output can be shared as one file.
+    output_folder = os.path.join(input_dir, build_output_folder_name())
+    os.makedirs(output_folder, exist_ok=True)
 
-    wb.save(output_path)
+    print(f"Done! {len(rows)} rows written to {output_folder}/:")
+    for region, group_rows in sorted(outputs.items(), key=lambda kv: kv[0] or ""):
+        output_path = os.path.join(output_folder, build_output_name(region))
 
-    print(f"Done! {len(rows)} rows written to:")
-    print(f"  {output_path}")
-    if pivot_ws is not None:
-        print("  + Pivot sheet (Date x Alert Type, plus Alerts per Day)")
-    elif not args.no_pivot:
-        print("  (No Pivot sheet: couldn't find Date/Type columns)")
+        wb = openpyxl.Workbook()
+        write_data_sheet(
+            wb, group_rows, has_header=has_header,
+            historical_age_days=None if args.no_ageing else args.historical_age_days,
+        )
+
+        pivot_ws = None
+        if not args.no_pivot:
+            pivot_ws = add_pivot_sheet(wb, group_rows, has_header)
+
+        wb.save(output_path)
+
+        print(f"  {os.path.basename(output_path)}  ({len(group_rows) - 1 if has_header else len(group_rows)} rows)")
+        if pivot_ws is not None:
+            print("    + Pivot sheet (Date x Alert Type, plus Alerts per Day)")
+        elif not args.no_pivot:
+            print("    (No Pivot sheet: couldn't find Date/Type columns)")
+
+    zip_path = shutil.make_archive(output_folder, "zip", root_dir=input_dir, base_dir=os.path.basename(output_folder))
+    print(f"  Zipped: {zip_path}")
 
 
 if __name__ == "__main__":
